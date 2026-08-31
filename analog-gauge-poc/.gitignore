@@ -1,0 +1,10 @@
+.venv/
+.cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+models/*.pt
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep

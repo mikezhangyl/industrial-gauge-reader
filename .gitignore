@@ -1,0 +1,35 @@
+.DS_Store
+.venv/
+**/.venv/
+**/__pycache__/
+*.py[cod]
+.ruff_cache/
+**/.ruff_cache/
+.pytest_cache/
+**/.pytest_cache/
+
+# Downloaded model weights and local caches
+**/models/*.pt
+**/models/*.onnx
+**/models/*.mlmodel
+**/.cache/
+
+# Generated reports and recorded camera frames
+**/output/*
+!**/output/.gitkeep
+**/sessions/*
+!**/sessions/.gitkeep
+
+# User-provided or locally captured media is not published
+analog-gauge-poc/input/*
+!analog-gauge-poc/input/.gitkeep
+test/
+*.mov
+*.mp4
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
