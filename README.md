@@ -41,10 +41,10 @@ MacBook 摄像头连续跟踪 PoC：
 
 ## 许可证
 
-本项目采用 [PolyForm Noncommercial License 1.0.0](LICENSE.md)：
+本项目采用双许可模式：
 
-- 允许许可证规定范围内的非商业学习、研究和实验用途。
-- **商业用途必须事先取得单独的书面授权。**
+- 默认按 [GNU Affero General Public License v3.0（AGPL-3.0）](LICENSE) 开源。学习、研究和商业使用都可以，但必须完整遵守 AGPL-3.0，包括向网络用户提供对应源码等义务。
+- 如果希望将本项目用于闭源产品、企业内部私有系统、闭源 SaaS、客户交付或其他不公开完整对应源码的场景，必须事先取得单独的书面商业许可。
 - 第三方依赖、工具和预训练模型遵循各自的许可证与使用条款。
 
-由于包含商业用途限制，本项目准确地说属于“源码公开（source-available）”，**不是 OSI 定义的开源软件**。商业授权说明见 [`COMMERCIAL_LICENSE.md`](COMMERCIAL_LICENSE.md)。
+商业许可不能替代 Ultralytics Enterprise 或其他第三方授权。详细说明见 [`COMMERCIAL_LICENSE.md`](COMMERCIAL_LICENSE.md)、[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 和 [`docs/model-weight-licensing.md`](docs/model-weight-licensing.md)。
