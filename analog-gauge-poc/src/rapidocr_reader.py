@@ -27,6 +27,7 @@ from src.ethz_vision_reader import (
     ellipse_residual,
 )
 from src.gauge_reader import GaugeResult, StageTimings, angle_from_points, synchronize
+from src.instrument_reading import InstrumentReadingInterpreter
 
 DETECTION_SIZE = 640
 SEGMENTATION_SIZE = 448
@@ -34,6 +35,14 @@ RECTIFIED_SIZE = 640
 DIAL_RADIUS = RECTIFIED_SIZE * 0.47
 SECTOR_STEP_DEGREES = 15
 NUMBER_PATTERN = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
+RAPIDOCR_PARAMS: dict[str, object] = {
+    "Global.use_cls": False,
+    "Global.log_level": "error",
+    "Rec.rec_batch_num": 32,
+    "EngineConfig.onnxruntime.use_coreml": False,
+    "EngineConfig.onnxruntime.intra_op_num_threads": 4,
+    "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -88,6 +97,34 @@ def is_unclipped_tile_candidate(
     return not (tile_y2 < image_height and y2 >= tile_y2 - margin)
 
 
+def deduplicate_dial_candidates(
+    candidates: list[DialCandidate], iou_threshold: float = 0.35
+) -> list[DialCandidate]:
+    """Keep the strongest non-overlapping detection for each physical dial."""
+    selected: list[DialCandidate] = []
+    for candidate in sorted(candidates, key=lambda item: item.confidence, reverse=True):
+        if all(
+            _bbox_iou(candidate.bbox, existing.bbox) < iou_threshold
+            for existing in selected
+        ):
+            selected.append(candidate)
+    return selected
+
+
+def _bbox_iou(
+    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+) -> float:
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
+    second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union else 0.0
+
+
 def _window_starts(length: int, window: int) -> list[int]:
     if window >= length:
         return [0]
@@ -129,7 +166,9 @@ def adaptive_tile_levels(
                     if tile != (0, 0, image_width, image_height):
                         tiles.add(tile)
         if tiles:
-            levels.append(sorted(tiles, key=lambda item: (item[1], item[0], item[3], item[2])))
+            levels.append(
+                sorted(tiles, key=lambda item: (item[1], item[0], item[3], item[2]))
+            )
     return levels
 
 
@@ -173,7 +212,9 @@ def pointer_center_and_tip(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     )
     hub = np.mean(points[hub_active], axis=0)
     hub_projection = float((hub - mean) @ axis)
-    tip_projection = lower if hub_projection - lower >= upper - hub_projection else upper
+    tip_projection = (
+        lower if hub_projection - lower >= upper - hub_projection else upper
+    )
     tip = mean + axis * tip_projection
     return hub, tip
 
@@ -314,9 +355,25 @@ def recognize_numeric_sectors(
     return labels
 
 
-def recognize_full_dial(ocr: RapidOCR, rectified: np.ndarray) -> list[NumericLabel]:
+def visible_text_from_ocr_result(result: object) -> str:
+    texts = getattr(result, "txts", None)
+    scores = getattr(result, "scores", None)
+    if texts is None or scores is None:
+        return ""
+    return " ".join(
+        text.strip()
+        for text, score in zip(texts, scores, strict=True)
+        if float(score) >= 0.5 and text.strip()
+    )
+
+
+def recognize_full_dial(
+    ocr: RapidOCR,
+    rectified: np.ndarray,
+    recognition: object | None = None,
+) -> list[NumericLabel]:
     """Detect numeric text across the dial when the default annulus has too few hits."""
-    result = ocr(rectified)
+    result = recognition if recognition is not None else ocr(rectified)
     boxes = getattr(result, "boxes", None)
     texts = getattr(result, "txts", None)
     scores = getattr(result, "scores", None)
@@ -510,8 +567,16 @@ def pointer_from_rectified_mask(
     eigenvalues, eigenvectors = np.linalg.eigh(np.cov(centered, rowvar=False))
     axis = eigenvectors[:, int(np.argmax(eigenvalues))]
     projections = centered @ axis
-    positive = float(np.percentile(projections[projections > 0], 99))
-    negative = float(np.percentile(-projections[projections < 0], 99))
+    positive_values = projections[projections > 0]
+    negative_values = -projections[projections < 0]
+    positive = (
+        float(np.percentile(positive_values, 99)) if len(positive_values) else 0.0
+    )
+    negative = (
+        float(np.percentile(negative_values, 99)) if len(negative_values) else 0.0
+    )
+    if positive <= 0 and negative <= 0:
+        raise ValueError("Pointer direction could not be estimated")
     direction = axis if positive >= negative else -axis
     aspect_ratio = float(np.min(eigenvalues) / np.max(eigenvalues))
     if aspect_ratio > 0.02:
@@ -541,23 +606,50 @@ class EthzPaddleGaugeReader:
         segmentation_path: Path,
         device: str,
         units_per_major_segment: float = 1.0,
+        reading_interpreter: InstrumentReadingInterpreter | None = None,
     ):
         if units_per_major_segment <= 0:
             raise ValueError("units_per_major_segment must be positive")
         self.device = device
         self.units_per_major_segment = units_per_major_segment
+        self.reading_interpreter = reading_interpreter
         self.detector = YOLO(str(detector_path))
         self.segmenter = YOLO(str(segmentation_path))
-        self.ocr = RapidOCR(
-            params={
-                "Global.use_cls": False,
-                "Global.log_level": "error",
-                "Rec.rec_batch_num": 32,
-                "EngineConfig.onnxruntime.use_coreml": False,
-            }
-        )
+        self.ocr = RapidOCR(params=RAPIDOCR_PARAMS)
         self.last_rectified: np.ndarray | None = None
         self.last_ring: np.ndarray | None = None
+        self._visible_text_cache: dict[tuple[str, int, int], str] = {}
+
+    @staticmethod
+    def recognize_isolated_text_lines(crops: list[np.ndarray]) -> object:
+        """Keep specialized OCR batches from mutating the main OCR session state."""
+        isolated_ocr = RapidOCR(params=RAPIDOCR_PARAMS)
+        return isolated_ocr.recognize_txt(crops)
+
+    def _interpret_result(self, result: GaugeResult, visible_text: str) -> GaugeResult:
+        if self.reading_interpreter is None:
+            return result
+        return self.reading_interpreter.interpret(result, visible_text)
+
+    def _full_image_visible_text(self, image_path: Path, image: np.ndarray) -> str:
+        stat = image_path.stat()
+        key = (str(image_path.resolve()), stat.st_size, stat.st_mtime_ns)
+        cached = self._visible_text_cache.get(key)
+        if cached is not None:
+            return cached
+        visible_text = visible_text_from_ocr_result(self.ocr(image))
+        self._visible_text_cache[key] = visible_text
+        return visible_text
+
+    def detect_dial_candidates(self, image_path: Path) -> tuple[DialCandidate, ...]:
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError(f"Cannot decode image: {image_path}")
+        detection = self.detector.predict(
+            image, imgsz=DETECTION_SIZE, conf=0.20, device=self.device, verbose=False
+        )[0]
+        candidates = self._result_candidates(detection, (0, 0), image.shape[:2])
+        return tuple(deduplicate_dial_candidates(candidates))
 
     @staticmethod
     def _result_candidates(
@@ -606,8 +698,7 @@ class EthzPaddleGaugeReader:
             for x1, y1, x2, y2 in (candidate.bbox for candidate in selected)
         ]
         inputs = [
-            cv2.resize(crop, (SEGMENTATION_SIZE, SEGMENTATION_SIZE))
-            for crop in crops
+            cv2.resize(crop, (SEGMENTATION_SIZE, SEGMENTATION_SIZE)) for crop in crops
         ]
         segmentations = self.segmenter.predict(
             inputs,
@@ -690,9 +781,7 @@ class EthzPaddleGaugeReader:
         for tile, detection in zip(tiles, detections, strict=True):
             x1, y1, _, _ = tile
             candidates.extend(
-                self._result_candidates(
-                    detection, (x1, y1), image.shape[:2], tile=tile
-                )
+                self._result_candidates(detection, (x1, y1), image.shape[:2], tile=tile)
             )
         return candidates
 
@@ -707,7 +796,7 @@ class EthzPaddleGaugeReader:
         cv2.imwrite(str(ring_path), self.last_ring)
         return rectified_path, ring_path
 
-    def read(self, image_path: Path) -> GaugeResult:
+    def read(self, image_path: Path, *, visible_text_context: str = "") -> GaugeResult:
         preprocess_start = time.perf_counter_ns()
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
@@ -716,6 +805,8 @@ class EthzPaddleGaugeReader:
 
         synchronize(self.device)
         inference_start = time.perf_counter_ns()
+        image_visible_text = self._full_image_visible_text(image_path, image)
+        visible_text_context = f"{visible_text_context} {image_visible_text}".strip()
         detection = self.detector.predict(
             image, imgsz=DETECTION_SIZE, conf=0.25, device=self.device, verbose=False
         )[0]
@@ -752,7 +843,7 @@ class EthzPaddleGaugeReader:
             synchronize(self.device)
             inference_end = time.perf_counter_ns()
             candidate = max(candidates, key=lambda item: item.confidence, default=None)
-            return GaugeResult(
+            result = GaugeResult(
                 candidate is not None,
                 candidate.bbox if candidate else None,
                 candidate.confidence if candidate else None,
@@ -776,6 +867,7 @@ class EthzPaddleGaugeReader:
                     else "No geometrically valid gauge candidate"
                 ),
             )
+            return self._interpret_result(result, visible_text_context)
         candidate, mask, pointer_confidence, pointer_method = segmented
         bbox = candidate.bbox
         detection_confidence = candidate.confidence
@@ -793,6 +885,13 @@ class EthzPaddleGaugeReader:
             rectified_center, _ = pointer_center_and_tip(rectified_mask)
             direction, rectified_tip = pointer_from_rectified_mask(rectified_mask)
             rectified_tip = rectified_center + direction * DIAL_RADIUS
+            full_dial_recognition = self.ocr(rectified)
+            visible_text = " ".join(
+                (
+                    visible_text_context,
+                    visible_text_from_ocr_result(full_dial_recognition),
+                )
+            ).strip()
             labels = recognize_numeric_sectors(self.ocr, rectified)
             color_result: ColorScaleResult | None = None
             if (
@@ -813,25 +912,30 @@ class EthzPaddleGaugeReader:
                         rectified, direction, self.units_per_major_segment
                     )
                 except ValueError:
-                    labels = recognize_full_dial(self.ocr, rectified)
+                    labels = recognize_full_dial(
+                        self.ocr, rectified, full_dial_recognition
+                    )
             self.last_rectified = rectified
             self.last_ring = unwrap_scale_ring(rectified)
         except ValueError as error:
             synchronize(self.device)
             inference_end = time.perf_counter_ns()
-            return GaugeResult(
+            fallback_center, fallback_tip = pointer_center_and_tip(mask)
+            global_center = fallback_center + np.asarray((x1, y1))
+            global_tip = fallback_tip + np.asarray((x1, y1))
+            result = GaugeResult(
                 True,
                 bbox,
                 detection_confidence,
-                False,
+                True,
+                (float(global_center[0]), float(global_center[1])),
+                (float(global_tip[0]), float(global_tip[1])),
+                angle_from_points(fallback_center, fallback_tip),
                 None,
                 None,
                 None,
-                None,
-                None,
-                None,
-                detection_confidence,
-                None,
+                min(detection_confidence, pointer_confidence),
+                f"{pointer_method}+unrectified-pointer-fallback",
                 StageTimings(
                     (preprocess_end - preprocess_start) / 1e6,
                     (inference_end - inference_start) / 1e6,
@@ -839,6 +943,7 @@ class EthzPaddleGaugeReader:
                 ),
                 failure_reason=str(error),
             )
+            return self._interpret_result(result, visible_text_context)
         synchronize(self.device)
         inference_end = time.perf_counter_ns()
 
@@ -869,7 +974,7 @@ class EthzPaddleGaugeReader:
                 scale_confidence,
             )
             postprocess_end = time.perf_counter_ns()
-            return GaugeResult(
+            result = GaugeResult(
                 detected=True,
                 bbox=bbox,
                 detection_confidence=detection_confidence,
@@ -881,9 +986,7 @@ class EthzPaddleGaugeReader:
                 reading=reading,
                 unit=None,
                 confidence=confidence,
-                center_method=(
-                    f"{pointer_method}+edge-ellipse+affine-rectification"
-                ),
+                center_method=(f"{pointer_method}+edge-ellipse+affine-rectification"),
                 timings=StageTimings(
                     (preprocess_end - preprocess_start) / 1e6,
                     (inference_end - inference_start) / 1e6,
@@ -895,6 +998,7 @@ class EthzPaddleGaugeReader:
                 rejected_numeric_labels=tuple(label.text for label in rejected),
                 scale_rmse=fit.rmse,
             )
+            return self._interpret_result(result, visible_text)
         except ValueError as numeric_error:
             if color_result is None:
                 try:
@@ -905,7 +1009,7 @@ class EthzPaddleGaugeReader:
                     color_result = None
             if color_result is not None:
                 postprocess_end = time.perf_counter_ns()
-                return GaugeResult(
+                result = GaugeResult(
                     detected=True,
                     bbox=bbox,
                     detection_confidence=detection_confidence,
@@ -928,8 +1032,9 @@ class EthzPaddleGaugeReader:
                         (postprocess_end - postprocess_start) / 1e6,
                     ),
                 )
+                return self._interpret_result(result, visible_text)
             postprocess_end = time.perf_counter_ns()
-            return GaugeResult(
+            result = GaugeResult(
                 detected=True,
                 bbox=bbox,
                 detection_confidence=detection_confidence,
@@ -941,9 +1046,7 @@ class EthzPaddleGaugeReader:
                 reading=None,
                 unit=None,
                 confidence=min(detection_confidence, pointer_confidence),
-                center_method=(
-                    f"{pointer_method}+edge-ellipse+affine-rectification"
-                ),
+                center_method=(f"{pointer_method}+edge-ellipse+affine-rectification"),
                 timings=StageTimings(
                     (preprocess_end - preprocess_start) / 1e6,
                     (inference_end - inference_start) / 1e6,
@@ -952,3 +1055,4 @@ class EthzPaddleGaugeReader:
                 ocr_labels=tuple(label.text for label in labels),
                 failure_reason=str(numeric_error),
             )
+            return self._interpret_result(result, visible_text)

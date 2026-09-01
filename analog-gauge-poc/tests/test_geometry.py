@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from src.gauge_reader import angle_from_points, sweep_position
+from src.gauge_reader import angle_from_points, format_reading_value, sweep_position
 
 
 class GeometryTests(unittest.TestCase):
@@ -23,6 +23,10 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(total, 270.0)
         assert fraction is not None
         self.assertAlmostEqual(fraction, 0.5)
+
+    def test_categorical_reading_label_is_not_formatted_as_a_float(self):
+        self.assertEqual(format_reading_value("9a"), "9a")
+        self.assertEqual(format_reading_value(4.0), "4.00")
 
 
 if __name__ == "__main__":

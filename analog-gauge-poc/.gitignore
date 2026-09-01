@@ -8,3 +8,6 @@ input/*
 !input/.gitkeep
 output/*
 !output/.gitkeep
+observations/*
+!observations/.gitkeep
+metadata/instrument-types/*/*.pdf

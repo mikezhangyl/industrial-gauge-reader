@@ -21,6 +21,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 from benchmark import Metrics, available_devices, summary
 from src.gauge_reader import GaugeResult, StageTimings
+from src.instrument_metadata import InstrumentMetadataCatalog
+from src.instrument_reading import InstrumentReadingInterpreter
 from src.model_store import ensure_models
 from src.rapidocr_reader import EthzPaddleGaugeReader
 
@@ -74,9 +76,7 @@ def chinese_font(size: int) -> ImageFont.FreeTypeFont:
     raise FileNotFoundError("未找到可用于报告中文标注的字体")
 
 
-def annotate_chinese(
-    image_path: Path, result: GaugeResult, output_path: Path
-) -> None:
+def annotate_chinese(image_path: Path, result: GaugeResult, output_path: Path) -> None:
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"无法读取报告图片：{image_path}")
@@ -101,13 +101,17 @@ def annotate_chinese(
             )
 
     angle = format_value(result.angle_degrees, "°")
-    reading = format_value(result.reading)
+    reading = format_reading(result)
     lines = [
         f"表盘检测：{'成功' if result.level1 else '失败'}",
         f"指针角度：{angle}",
         f"实际读数：{reading}",
         f"三级读取：{'通过' if result.level3 else '失败'}",
     ]
+    if result.raw_reading is not None and result.raw_reading != result.reading:
+        lines.insert(3, f"视觉原始值：{format_value(result.raw_reading)}")
+    if result.instrument_type_id:
+        lines.insert(0, f"仪表类型：{result.instrument_type_id}")
     canvas = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).convert("RGBA")
     overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -130,9 +134,7 @@ def annotate_chinese(
         spacing=5,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    Image.alpha_composite(canvas, overlay).convert("RGB").save(
-        output_path, quality=90
-    )
+    Image.alpha_composite(canvas, overlay).convert("RGB").save(output_path, quality=90)
 
 
 def image_data_uri(path: Path, max_width: int = 720) -> str:
@@ -146,9 +148,7 @@ def image_data_uri(path: Path, max_width: int = 720) -> str:
             (max_width, max(1, round(image.shape[0] * scale))),
             interpolation=cv2.INTER_AREA,
         )
-    encoded, buffer = cv2.imencode(
-        ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82]
-    )
+    encoded, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82])
     if not encoded:
         raise RuntimeError(f"Cannot encode report image: {path}")
     payload = base64.b64encode(buffer.tobytes()).decode("ascii")
@@ -167,6 +167,12 @@ def result_payload(record: RegressionRecord) -> dict[str, object]:
         "level3": result.level3,
         "bbox": list(result.bbox) if result.bbox else None,
         "reading": result.reading,
+        "reading_candidates": list(result.reading_candidates),
+        "raw_reading": result.raw_reading,
+        "unit": result.unit,
+        "instrument_type_id": result.instrument_type_id,
+        "readout_channel_id": result.readout_channel_id,
+        "interpretation_method": result.interpretation_method,
         "angle_degrees": result.angle_degrees,
         "confidence": result.confidence,
         "center_method": result.center_method,
@@ -184,8 +190,21 @@ def badge(passed: bool, label: str) -> str:
     return f'<span class="badge {state}">{escape(label)} {"通过" if passed else "失败"}</span>'
 
 
-def format_value(value: float | None, suffix: str = "") -> str:
-    return "无" if value is None else f"{value:.2f}{suffix}"
+def format_value(value: float | str | None, suffix: str = "") -> str:
+    if value is None:
+        return "无"
+    if isinstance(value, str):
+        return f"{value}{suffix}"
+    return f"{value:.2f}{suffix}"
+
+
+def format_reading(result: GaugeResult) -> str:
+    if result.reading is not None:
+        return format_value(result.reading)
+    if result.reading_candidates:
+        candidates = "/".join(f"{value:.2f}" for value in result.reading_candidates)
+        return f"{candidates}（量程待确认）"
+    return "无"
 
 
 def method_label(method: str | None) -> str:
@@ -227,9 +246,7 @@ def build_html(
 
     total_cases = len(records)
     level3_passes = sum(record.result.level3 for record in records)
-    latency_passes = sum(
-        record.metrics["total"]["p95"] < 500.0 for record in records
-    )
+    latency_passes = sum(record.metrics["total"]["p95"] < 500.0 for record in records)
     cards: list[str] = []
     for image_name in sorted(by_image, key=lambda name: natural_key(Path(name))):
         device_records = by_image[image_name]
@@ -241,11 +258,16 @@ def build_html(
             record = device_records[device]
             result = record.result
             metrics = record.metrics
+            reading_text = format_reading(result)
+            if result.raw_reading is not None and result.raw_reading != result.reading:
+                reading_text += (
+                    f"<br><small>原始 {format_value(result.raw_reading)}</small>"
+                )
             rows.append(
                 "<tr>"
                 f"<td><strong>{escape(device.upper())}</strong></td>"
                 f"<td>{badge(result.level1, '一级')} {badge(result.level2, '二级')} {badge(result.level3, '三级')}</td>"
-                f"<td>{format_value(result.reading)}</td>"
+                f"<td>{reading_text}</td>"
                 f"<td>{format_value(result.angle_degrees, '°')}</td>"
                 f"<td>{metrics['total']['mean']:.2f}</td>"
                 f"<td>{metrics['total']['p50']:.2f}</td>"
@@ -270,7 +292,7 @@ def build_html(
               </div>
               <div class="table-wrap"><table>
                 <thead><tr><th>设备</th><th>识别层级</th><th>读数</th><th>指针角度</th><th>平均耗时</th><th>p50</th><th>p95</th><th>最小耗时</th><th>最大耗时</th><th>&lt;500毫秒</th></tr></thead>
-                <tbody>{''.join(rows)}</tbody>
+                <tbody>{"".join(rows)}</tbody>
               </table></div>
             </section>
             """
@@ -309,7 +331,7 @@ h2 {{margin:4px 0 0;font-size:26px}} .eyebrow {{font:700 12px/1.2 ui-monospace,m
   <div class="stat"><strong>{level3_passes}/{total_cases}</strong><span>三级实际读数通过（设备测试项）</span></div>
   <div class="stat"><strong>{latency_passes}/{total_cases}</strong><span>p95 &lt; 500 毫秒</span></div>
 </div>
-{''.join(cards)}
+{"".join(cards)}
 <footer>运行环境：{escape(platform.machine())} · {escape(platform.platform())} · Python {escape(sys.version.split()[0])} · PyTorch {escape(torch.__version__)}<br>{escape(load_text)}<br>注意：三级通过表示程序产生了实际读数，不等同于已经获得人工标注的准确性证明。</footer>
 </main></body></html>"""
 
@@ -345,12 +367,17 @@ def load_existing_results(
             angle_degrees=item["angle_degrees"],
             sweep_fraction=None,
             reading=item["reading"],
-            unit=None,
+            unit=item.get("unit"),
             confidence=item["confidence"],
             center_method=item["center_method"],
             timings=StageTimings(0.0, 0.0, 0.0),
             ocr_labels=tuple(item["ocr_labels"]),
             failure_reason=item["failure_reason"],
+            raw_reading=item.get("raw_reading"),
+            instrument_type_id=item.get("instrument_type_id"),
+            readout_channel_id=item.get("readout_channel_id"),
+            interpretation_method=item.get("interpretation_method"),
+            reading_candidates=tuple(item.get("reading_candidates", [])),
         )
         annotated_path = Path(item["annotated_image"])
         if not annotated_path.is_absolute():
@@ -365,8 +392,7 @@ def load_existing_results(
             )
         )
     model_load_ms = {
-        str(device): float(value)
-        for device, value in payload["model_load_ms"].items()
+        str(device): float(value) for device, value in payload["model_load_ms"].items()
     }
     return (
         records,
@@ -414,6 +440,7 @@ def main() -> int:
         parser.error("Every input image must exist")
 
     models = ensure_models(PROJECT_ROOT / "models")
+    reading_interpreter = InstrumentReadingInterpreter(InstrumentMetadataCatalog.load())
     devices = available_devices(args.device)
     asset_dir = args.output.with_name(f"{args.output.stem}-assets")
     asset_dir.mkdir(parents=True, exist_ok=True)
@@ -425,6 +452,7 @@ def main() -> int:
             models["ethz-gauge-detection.pt"],
             models["ethz-segmentation.pt"],
             device,
+            reading_interpreter=reading_interpreter,
         )
         model_load_ms[device] = (time.perf_counter_ns() - load_start) / 1e6
         for image_path in image_paths:

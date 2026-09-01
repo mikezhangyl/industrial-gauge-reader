@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "synchronous_voltmeter",
+    "canonical_name_zh": "同期电压表",
+    "aliases_zh": [
+      "同步电压表"
+    ],
+    "model_markings": [
+      "D96-V"
+    ],
+    "recognition_signatures": [
+      ["同期电压表", "30", "60"]
+    ],
+    "knowledge_status": "confirmed",
+    "summary_zh": "用于读取同期电压的模拟指针电压表；同一表盘可印有两套量程。",
+    "readout_channels": [
+      {
+        "channel_id": "synchronizing_voltage",
+        "name_zh": "同期电压",
+        "display_type": "analog_pointer",
+        "quantity_kind": "voltage",
+        "unit": "V",
+        "value_format": "decimal",
+        "semantics_zh": "指针相对所选量程刻度给出同期电压。",
+        "scales": [
+          {
+            "minimum": 0,
+            "maximum": 30,
+            "minor_division": 1
+          },
+          {
+            "minimum": 0,
+            "maximum": 60,
+            "minor_division": 2
+          }
+        ],
+        "dial_arc": {
+          "start_angle_degrees": 268,
+          "end_angle_degrees": 92,
+          "direction": "clockwise",
+          "endpoint_snap_degrees": 2,
+          "quantize_to_minor_division": true
+        }
+      }
+    ],
+    "interpretation_rules_zh": [
+      "表盘同时印有 0–30 V 和 0–60 V 两套刻度。",
+      "实际采用哪套量程取决于接线或量程配置，不能仅凭表盘照片猜测。",
+      "斜拍时应考虑指针高于刻度面的视差，不把投影重合直接当作精确刻线位置。"
+    ],
+    "sources": [
+      {
+        "source_type": "user_confirmed_image_review",
+        "title": "2026-09-01 同期电压表图片复核",
+        "reference": "sha256:b15144f6b5abbf6eaa5c375896c971570bd1cace94e0676c85ef47f8f30b7ae1"
+      }
+    ]
+  }
+}

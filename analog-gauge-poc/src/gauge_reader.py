@@ -36,7 +36,7 @@ class GaugeResult:
     pointer_tip: tuple[float, float] | None
     angle_degrees: float | None
     sweep_fraction: float | None
-    reading: float | None
+    reading: float | str | None
     unit: str | None
     confidence: float | None
     center_method: str | None
@@ -45,6 +45,11 @@ class GaugeResult:
     rejected_numeric_labels: tuple[str, ...] = ()
     scale_rmse: float | None = None
     failure_reason: str | None = None
+    raw_reading: float | str | None = None
+    instrument_type_id: str | None = None
+    readout_channel_id: str | None = None
+    interpretation_method: str | None = None
+    reading_candidates: tuple[float, ...] = ()
 
     @property
     def level1(self) -> bool:
@@ -72,6 +77,11 @@ def angle_from_points(
     delta_x = float(tip[0] - center[0])
     delta_y = float(tip[1] - center[1])
     return (math.degrees(math.atan2(delta_x, -delta_y)) + 360.0) % 360.0
+
+
+def format_reading_value(value: float | str) -> str:
+    """Format continuous values and categorical dial labels without coercion."""
+    return value if isinstance(value, str) else f"{value:.2f}"
 
 
 def sweep_position(
@@ -356,16 +366,29 @@ def annotate(image_path: Path, result: GaugeResult, output_path: Path) -> None:
         if result.sweep_fraction is None
         else f"{result.sweep_fraction * 100.0:.1f}%"
     )
-    reading_text = (
-        "N/A (scale not interpreted)"
-        if result.reading is None
-        else f"{result.reading:.2f}"
+    if result.reading is not None:
+        reading_text = (
+            f"{format_reading_value(result.reading)} {result.unit or ''}".rstrip()
+        )
+    elif result.reading_candidates:
+        candidates = "/".join(f"{value:.2f}" for value in result.reading_candidates)
+        reading_text = f"{candidates} {result.unit or ''} (scale ambiguous)".rstrip()
+    else:
+        reading_text = "N/A (scale not interpreted)"
+    lines: list[str] = []
+    if result.instrument_type_id:
+        lines.append(f"Instrument: {result.instrument_type_id}")
+    lines.extend(
+        [
+            f"Pointer angle: {angle_text}",
+            f"Sweep position: {fraction_text}",
+            f"Reading: {reading_text}",
+        ]
     )
-    lines = [
-        f"Pointer angle: {angle_text}",
-        f"Sweep position: {fraction_text}",
-        f"Reading: {reading_text}",
-    ]
+    if result.raw_reading is not None and result.raw_reading != result.reading:
+        lines.append(
+            f"Raw visual reading: {format_reading_value(result.raw_reading)}"
+        )
     for index, line in enumerate(lines):
         y = 38 + index * 34
         cv2.putText(image, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 5)

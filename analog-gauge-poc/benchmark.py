@@ -15,7 +15,14 @@ from typing import Protocol
 import numpy as np
 import torch
 
-from src.gauge_reader import AnalogGaugeReader, GaugeResult, annotate
+from src.gauge_reader import (
+    AnalogGaugeReader,
+    GaugeResult,
+    annotate,
+    format_reading_value,
+)
+from src.instrument_metadata import InstrumentMetadataCatalog
+from src.instrument_reading import InstrumentReadingInterpreter
 from src.model_store import ensure_models
 from src.rapidocr_reader import EthzPaddleGaugeReader
 
@@ -71,11 +78,13 @@ def available_devices(selection: str) -> list[str]:
 def print_result(result: GaugeResult) -> None:
     print(f"Gauge detected: {'yes' if result.detected else 'no'}")
     print(f"Bounding box: {list(result.bbox) if result.bbox else 'N/A'}")
-    print(
-        f"Reading: {result.reading:.2f}"
-        if result.reading is not None
-        else "Reading: N/A"
-    )
+    if result.reading is not None:
+        print(f"Reading: {format_reading_value(result.reading)}")
+    elif result.reading_candidates:
+        candidates = "/".join(f"{value:.2f}" for value in result.reading_candidates)
+        print(f"Reading candidates: {candidates} (active scale unknown)")
+    else:
+        print("Reading: N/A")
     print(
         f"Confidence: {result.confidence:.2f}"
         if result.confidence is not None
@@ -92,6 +101,14 @@ def print_result(result: GaugeResult) -> None:
     print(f"Center method: {result.center_method or 'N/A'}")
     if result.unit:
         print(f"Reading unit: {result.unit}")
+    if result.raw_reading is not None and result.raw_reading != result.reading:
+        print(f"Raw visual reading: {format_reading_value(result.raw_reading)}")
+    if result.instrument_type_id:
+        print(f"Instrument type: {result.instrument_type_id}")
+    if result.readout_channel_id:
+        print(f"Readout channel: {result.readout_channel_id}")
+    if result.interpretation_method:
+        print(f"Interpretation: {result.interpretation_method}")
     if result.ocr_labels:
         print(f"OCR scale labels used: {list(result.ocr_labels)}")
     if result.rejected_numeric_labels:
@@ -177,6 +194,7 @@ def main() -> int:
 
     setup_start = time.perf_counter_ns()
     models = ensure_models(PROJECT_ROOT / "models")
+    reading_interpreter = InstrumentReadingInterpreter(InstrumentMetadataCatalog.load())
     setup_ms = (time.perf_counter_ns() - setup_start) / 1e6
     print(f"Artifact/helper setup: {setup_ms:.2f} ms (excluded from steady state)")
 
@@ -194,6 +212,7 @@ def main() -> int:
                 models["ethz-segmentation.pt"],
                 device,
                 args.units_per_major_segment,
+                reading_interpreter,
             ),
         ),
     ]
@@ -215,6 +234,7 @@ def main() -> int:
         records,
         key=lambda record: (
             not record.result.level3,
+            not record.result.reading_candidates,
             not record.result.level2,
             not record.result.level1,
             record.metrics["total"]["p95"],
@@ -239,14 +259,26 @@ def main() -> int:
             f"{record.metrics['total']['p50']:.2f} ms | "
             f"{record.metrics['total']['p95']:.2f} ms |"
         )
-    print(
-        f"\nBest usable result: {best.model_name} / {best.device.upper()} / "
-        f"reading {best.result.reading:.2f} / "
-        f"p50 {best.metrics['total']['p50']:.2f} ms / "
-        f"p95 {best.metrics['total']['p95']:.2f} ms"
-        if best.result.reading is not None
-        else f"\nNo candidate produced a physical reading; best stage result: {best.model_name}"
-    )
+    if best.result.reading is not None:
+        print(
+            f"\nBest usable result: {best.model_name} / {best.device.upper()} / "
+            f"reading {format_reading_value(best.result.reading)} / "
+            f"p50 {best.metrics['total']['p50']:.2f} ms / "
+            f"p95 {best.metrics['total']['p95']:.2f} ms"
+        )
+    elif best.result.reading_candidates:
+        candidate_text = "/".join(
+            f"{value:.2f}" for value in best.result.reading_candidates
+        )
+        print(
+            f"\nScale-ambiguous result: {best.model_name} / "
+            f"candidates {candidate_text} {best.result.unit or ''}".rstrip()
+        )
+    else:
+        print(
+            "\nNo candidate produced a physical reading; "
+            f"best stage result: {best.model_name}"
+        )
     return 0
 
 

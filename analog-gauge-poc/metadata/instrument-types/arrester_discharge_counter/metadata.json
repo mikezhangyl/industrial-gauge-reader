@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "arrester_discharge_counter",
+    "canonical_name_zh": "避雷器用指针式放电计数器",
+    "aliases_zh": [
+      "放电计数器",
+      "避雷器放电计数器",
+      "雷击计数器"
+    ],
+    "model_markings": [
+      "JS-9",
+      "放电计数器",
+      "上海电瓷厂有限公司"
+    ],
+    "knowledge_status": "confirmed",
+    "summary_zh": "与避雷器配套使用，通过单指针圆形计数盘显示避雷器放电动作的当前计数位。",
+    "readout_channels": [
+      {
+        "channel_id": "discharge_count_display",
+        "name_zh": "放电动作计数显示值",
+        "display_type": "single_pointer_circular_counter",
+        "quantity_kind": "event_count_display",
+        "unit": "count",
+        "value_format": "single_digit_integer",
+        "semantics_zh": "指针在 0–9 圆形数字盘上指出当前显示的放电动作计数位。",
+        "scales": [],
+        "allowed_values": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9"
+        ],
+        "reading_normalization": {
+          "strategy": "nearest_allowed_integer",
+          "maximum_distance": 0.5
+        }
+      }
+    ],
+    "interpretation_rules_zh": [
+      "0 位于表盘顶部，数字沿顺时针方向从 1 递增到 9。",
+      "这是离散动作计数盘，不是连续模拟量；指针应归到最近的整数数字，不输出小数。",
+      "合法业务读数是 0–9 的非负整数，不允许负数；指针位于零位而几何算法给出接近 0 的负小数时，按 0 记录。",
+      "表盘只有 0–9 单圈显示；没有复位、进位或检修记录时，只报告当前可见数字，不推断设备全寿命累计动作总数。",
+      "表盘序列号和出厂编号不是读数通道。"
+    ],
+    "sources": [
+      {
+        "source_type": "manufacturer_product_catalog",
+        "title": "上海电瓷厂有限公司产品中心：监视仪&计数器",
+        "url": "https://www.sepw.com.cn/",
+        "retrieved_at": "2026-09-01"
+      },
+      {
+        "source_type": "current_industry_standard",
+        "title": "JB/T 10492-2025 金属氧化物避雷器用监测装置",
+        "url": "https://std.samr.gov.cn/hb/search/stdHBDetailed?id=39DF311C1B6DB00FE06397BE0A0A304D",
+        "reference": "2025-11-01 起实施，代替 JB/T 10492-2011",
+        "retrieved_at": "2026-09-01"
+      },
+      {
+        "source_type": "industry_standard_model_nomenclature",
+        "title": "JB/T 8459-2011 避雷器产品型号编制方法",
+        "url": "https://std.samr.gov.cn/hb/search/stdHBDetailedCNF?id=8B1827F1D518BB19E05397BE0A0AB44A",
+        "retrieved_at": "2026-09-01"
+      },
+      {
+        "source_type": "user_confirmed_image_review",
+        "title": "2026-09-01 JS-9 放电计数器图片复核",
+        "reference": "sha256:9da6cf92bf45bfc9b1e02937031aad9b1ebe7ec89bdfc7f3fd8dafb3ce12cf86"
+      }
+    ]
+  }
+}

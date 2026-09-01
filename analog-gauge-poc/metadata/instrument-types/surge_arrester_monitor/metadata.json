@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "surge_arrester_monitor",
+    "canonical_name_zh": "避雷器监测器",
+    "aliases_zh": [
+      "避雷器在线监测器",
+      "避雷器用监测器"
+    ],
+    "model_markings": [
+      "JCQ-10/600Z"
+    ],
+    "recognition_signatures": [
+      ["mA", "005", "动作电流"]
+    ],
+    "knowledge_status": "confirmed",
+    "summary_zh": "同时监测避雷器持续泄漏电流并累计记录避雷器放电动作次数。",
+    "readout_channels": [
+      {
+        "channel_id": "continuous_leakage_current",
+        "name_zh": "持续泄漏电流",
+        "display_type": "analog_pointer",
+        "quantity_kind": "electric_current",
+        "unit": "mA",
+        "value_format": "decimal",
+        "semantics_zh": "下方模拟指针显示运行电压下持续通过避雷器的泄漏电流。",
+        "scales": [
+          {
+            "minimum": 0,
+            "maximum": 1.0,
+            "minor_division": 0.05
+          }
+        ],
+        "dial_arc": {
+          "start_angle_degrees": 310,
+          "end_angle_degrees": 50,
+          "direction": "clockwise",
+          "endpoint_snap_degrees": 6,
+          "quantize_to_minor_division": false
+        }
+      },
+      {
+        "channel_id": "arrester_operation_count",
+        "name_zh": "避雷器动作次数",
+        "display_type": "mechanical_counter",
+        "quantity_kind": "event_count",
+        "unit": "count",
+        "value_format": "non_negative_integer",
+        "semantics_zh": "上方机械计数窗累计记录雷击或过电压引起的避雷器放电动作次数。",
+        "scales": []
+      }
+    ],
+    "interpretation_rules_zh": [
+      "机械计数窗不是电流读数，必须与下方 mA 指针分开识别。",
+      "机械计数窗保留前导零显示；例如 005 解释为累计动作 5 次。",
+      "下方模拟指针只解释为持续泄漏电流，单位为 mA。"
+    ],
+    "sources": [
+      {
+        "source_type": "manufacturer_product_documentation",
+        "title": "西安秦阳电气 JCQ 系列在线监测器",
+        "url": "https://qinyangdianqi.com/lm5/49.html",
+        "retrieved_at": "2026-09-01"
+      },
+      {
+        "source_type": "manufacturer_catalog",
+        "title": "正泰高压产品总汇：避雷器用监测器",
+        "url": "https://www.chint.com/bocupload/2025/04/11/%E6%AD%A3%E6%B3%B0%E9%AB%98%E5%8E%8B%E4%BA%A7%E5%93%81%E6%80%BB%E6%B1%87.pdf",
+        "retrieved_at": "2026-09-01"
+      }
+    ]
+  }
+}

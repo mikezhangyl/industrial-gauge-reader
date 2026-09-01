@@ -11,9 +11,12 @@
 - 从整张图片自动寻找表盘。
 - 识别中心、指针和角度。
 - 结合 OCR、刻度和颜色区域推算读数。
+- 查询带证据来源的仪表类型知识，区分同一仪表上的多个读数通道，并将原始视觉读数解释为可审计的业务读数。
 - 支持批量回归测试和 HTML 报告。
 
 使用说明见 [`analog-gauge-poc/README.md`](analog-gauge-poc/README.md)。
+
+处理用户确认的现场仪表图片或生成固定格式图文报告时，AI Agent 必须遵循 [`analog-gauge-poc/docs/user-instrument-batch-runbook.md`](analog-gauge-poc/docs/user-instrument-batch-runbook.md)。
 
 ### `camera-clock-poc`
 
@@ -36,6 +39,7 @@ MacBook 摄像头连续跟踪 PoC：
 - 摄像头 session、逐帧图片和生成报告。
 - 用户提供的工业现场图片。
 - 本地录制的视频。
+- 未确认再分发许可的第三方厂家说明书本地副本。
 
 运行项目前需要按照各子项目 README 下载或准备相应模型和输入文件。
 

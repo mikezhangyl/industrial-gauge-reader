@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "shm_d_motor_drive_unit",
+    "canonical_name_zh": "SHM-D 有载分接开关电动机构",
+    "aliases_zh": [
+      "有载分接开关电动机构",
+      "分接开关电动机构",
+      "电动机构"
+    ],
+    "model_markings": [
+      "SHM-D",
+      "HM",
+      "Motor drive unit"
+    ],
+    "knowledge_status": "confirmed",
+    "summary_zh": "用于驱动有载分接开关，并在面板上显示当前分接位置、机构状态和累计操作次数。",
+    "readout_channels": [
+      {
+        "channel_id": "tap_position",
+        "name_zh": "当前分接位置",
+        "display_type": "discrete_pointer_dial",
+        "quantity_kind": "tap_position",
+        "unit": "tap_position",
+        "value_format": "categorical_label",
+        "semantics_zh": "外圈长指针指向当前离散分接位置标签。",
+        "scales": []
+      },
+      {
+        "channel_id": "mechanism_status",
+        "name_zh": "机构状态",
+        "display_type": "mechanical_status_indicator",
+        "quantity_kind": "mechanism_state",
+        "unit": "state",
+        "value_format": "categorical_state",
+        "semantics_zh": "内圈短指针和分区环用于指示分接变换过程以及机构是否到位。",
+        "scales": [],
+        "allowed_values": [
+          "at_position",
+          "in_transition"
+        ]
+      },
+      {
+        "channel_id": "operation_count",
+        "name_zh": "累计操作次数",
+        "display_type": "mechanical_counter",
+        "quantity_kind": "event_count",
+        "unit": "count",
+        "value_format": "non_negative_integer",
+        "semantics_zh": "机械计数窗累计记录电动机构完成分接操作的次数。",
+        "scales": []
+      }
+    ],
+    "interpretation_rules_zh": [
+      "外圈长指针才是当前分接位置，内圈短指针和分区环是独立的机构状态通道。",
+      "分接位置是离散标签，不是连续物理量；字母后缀必须逐字保留，例如 9a、9b、9c 不能合并成 9。",
+      "位置标签和位置数量由所配有载分接开关决定，不能把一台设备的标签序列作为所有 SHM-D 的固定量程。",
+      "内圈指针位于底部到位分区时解释为机构已完成变换并到位。",
+      "机械计数窗保留原始前导零，同时另存整数值；例如 003617 表示累计操作 3617 次。",
+      "铭牌上的日期、重量和序列号不属于仪表读数通道。"
+    ],
+    "sources": [
+      {
+        "source_type": "manufacturer_operation_manual",
+        "title": "SHM-D Digital Control Motor Drive Unit Operation instruction",
+        "url": "https://www.huaming.com.tr/images/produc/produc_1/MDU%20and%20Accessories/%5BMDU%5D%20SHM-D%20%26%20SHM-DL/SHM-D%20%26%20SHM-DL%20MDU%20Operation%20instruction-HM0%20460%201381.pdf",
+        "reference": "Appendix 3, PDF page 19 (printed page 15): item 1 counter, item 8 status indication, item 9 tap change indication",
+        "retrieved_at": "2026-09-01",
+        "local_path": "SHM-D_SHM-DL_operation_instruction_HM0-460-1381.pdf",
+        "sha256": "d001a2701cbf1c90bf51b81ce24d8bdff789fd2d5562965aaf57a116310a9513",
+        "document_code": "HM 0.460.1381-01.10/2014",
+        "language": "en"
+      },
+      {
+        "source_type": "manufacturer_product_page",
+        "title": "Huaming SHM-D motor drive unit",
+        "url": "https://intl-huaming.com/products-page/product/11-shm-d",
+        "retrieved_at": "2026-09-01"
+      },
+      {
+        "source_type": "user_confirmed_image_review",
+        "title": "2026-09-01 SHM-D 面板图片复核",
+        "reference": "sha256:6999664f62d137cc5bc8b10c5bce6f42a614f422d8bafcba625790feda16e1ca"
+      }
+    ]
+  }
+}

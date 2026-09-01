@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "transformer_pointer_oil_level_indicator",
+    "canonical_name_zh": "变压器指针式油位计",
+    "aliases_zh": [
+      "变压器油位计",
+      "指针式油位表",
+      "油位传感器"
+    ],
+    "model_markings": [
+      "YZF3",
+      "KEQI",
+      "OIL LEVEL"
+    ],
+    "knowledge_status": "confirmed",
+    "summary_zh": "通过浮球、传动机构和磁耦合驱动指针，显示变压器储油柜的相对油位，并可在高低限位置输出报警信号。",
+    "readout_channels": [
+      {
+        "channel_id": "relative_oil_level",
+        "name_zh": "相对油位",
+        "display_type": "analog_pointer_with_counterweight",
+        "quantity_kind": "relative_liquid_level",
+        "unit": "relative_scale",
+        "value_format": "decimal",
+        "semantics_zh": "细长指针端在 0–10 条件刻度上显示储油柜相对油位。",
+        "scales": [
+          {
+            "minimum": 0,
+            "maximum": 10,
+            "minor_division": 1
+          }
+        ]
+      }
+    ],
+    "interpretation_rules_zh": [
+      "读取穿过轴心并伸向刻度环的细长指针端。",
+      "轴心另一侧朝向相反方向的短粗块是指针配重，不是第二根读数指针。",
+      "0 对应 MIN，10 对应 MAX；刻度值是相对油位位置，没有直接物理单位。",
+      "未经设备标定或容积映射，不得把 3.4/10 直接解释为储油柜容量的 34%。",
+      "0 和 10 附近的红色块是高低限报警标记，不参与指针读数。"
+    ],
+    "sources": [
+      {
+        "source_type": "official_type_description",
+        "title": "YZF3 油位传感器型式说明",
+        "url": "https://all-pribors.ru/docs/2024-92594-24.pdf",
+        "retrieved_at": "2026-09-01"
+      },
+      {
+        "source_type": "manufacturer_product_documentation",
+        "title": "YZF 系列变压器用指针式油位计",
+        "url": "https://www.syzhiyue.cn/productdetails/170.html",
+        "retrieved_at": "2026-09-01"
+      }
+    ]
+  }
+}

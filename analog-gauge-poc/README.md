@@ -29,9 +29,11 @@
 → ETHZ 指针分割
 → 从指针最粗处估算轴心，使用可见圆弧拟合被遮挡的表盘椭圆
 → 椭圆仿射校正为圆形表盘
+→ 全表盘 OCR 识别可见型号和名称，唯一匹配仪表类型知识包
 → 数字分支：刻度环 OCR → 鲁棒线性刻度拟合
 → 颜色分支：红绿分段 → 红绿交界零点 → 相对段值
-→ 指针角度映射为刻度读数
+→ 指针角度映射为原始视觉读数
+→ 按 metadata 解释或归整为业务读数，并同时保留两者供审计
 ```
 
 - Level 1：自动检测表盘，不接受固定 ROI。
@@ -40,6 +42,60 @@
 - `Confidence` 是检测、分割、OCR 和拟合质量的保守组合，不是经过校准的业务正确率。
 
 生产代码中没有写死测试图片的 ROI、中心、角度、刻度位置、量程或读数。
+
+## 仪表类型专业知识
+
+每个仪表类型使用一个独立知识包，不保存某张图片的具体读数：
+
+```text
+metadata/instrument-types/<type_id>/
+├── metadata.json
+└── 厂家说明书.pdf（能够获取并核验时的本地副本）
+```
+
+`metadata.json` 记录：
+
+- 可见名称和型号标记；
+- 一个或多个独立读数通道；
+- 每个通道的显示方式、物理量、单位、量程和最小分度；
+- 离散表盘的允许值及可审计的读数归整策略；
+- 防止混淆不同显示区域的解释规则；
+- 厂家资料、表盘文字或人工确认等证据来源。
+
+例如，避雷器监测器有两个独立通道：下方指针是持续泄漏电流，上方机械计数窗是累计动作次数。`005` 应解释为动作 5 次，不能作为 `5 mA` 进入电流读数。
+
+SHM-D 电动机构有三个独立通道：外圈长指针是当前分接位置，内圈是机构状态，机械计数窗是累计操作次数。位置标签是离散值，`9a`、`9b`、`9c` 不能合并成 `9`。厂家说明书和对应 `metadata.json` 位于同一类型目录，metadata 同时保存官方 URL、文档编号和本地文件 SHA-256。
+
+JS-9 指针式放电计数器是离散的单圈数字盘，不按连续模拟刻度输出小数。表盘显示 `0` 时只记录当前可见数字 `0`；没有复位、进位或检修记录时，不据此推断设备全寿命累计动作总数。程序会保留几何算法得到的原始视觉读数，例如 `-0.05`，再按该类型 metadata 的允许值和最大归整距离输出业务读数 `0`。
+
+查询已经收录的类型：
+
+```bash
+python -m src.instrument_metadata "JCQ-10/600Z 避雷器监测器"
+python -m src.instrument_metadata "D96-V 同期电压表"
+python -m src.instrument_metadata "SHM-D Motor drive unit"
+python -m src.instrument_metadata "上海电瓷厂 JS-9 放电计数器"
+```
+
+加载器会自动合并各类型目录，验证 schema 版本、类型和通道 ID 唯一性、量程、允许值、归整规则以及证据来源；本地说明书存在时还会核对 SHA-256。识别链路通过 `InstrumentMetadataCatalog.find()` 匹配类型，再由 `InstrumentReadingInterpreter` 解释读数，不在 OCR 或通用几何代码中复制 JS-9 等具体仪表的专业规则。OCR 不能唯一匹配类型时，程序保留原始视觉结果，不擅自套用类型规则。
+
+整图类型识别会合并表盘 OCR 和画面其他区域的型号、设备名称。对于同一画面中的多个仪表，`MetadataAwareImageAnalyzer` 对表盘候选去重并逐个读取；机械计数窗作为独立通道识别，原始 OCR、易混字符归整值和最终整数分别保留。双量程表在无法确认接线量程时输出候选值，不强行选择其中一个。
+
+厂家说明书属于第三方资料。未确认再分发许可前，PDF 本地副本默认不进入 Git；可跟踪的 metadata 保留官方地址、文件名和哈希，既能在本机与专业知识同目录使用，也不会把第三方文档直接发布到公开仓库。厂家未公开说明书时，只记录已核验的官方产品页和现行标准，不把第三方销售页冒充厂家说明书。
+
+用户明确提供的人工确认值与类型知识分开保存在本地 `observations/`。该目录默认不进入 Git；只有空目录占位文件会被跟踪，避免将用户现场读数发布到公开仓库。新图片自动报告不要求 observation。
+
+对一批新图片生成多实例、多通道自动识别报告：
+
+```bash
+python batch_instrument_report.py image-1.jpg image-2.jpg image-3.jpg \
+  --device cpu \
+  --output output/user-instrument-batch.json
+```
+
+输出 `output/user-instrument-batch.json` 和同名 HTML。HTML 按图片展示内嵌原图、程序识别结果、状态、方法、原始显示和说明，不依赖原始临时图片路径，也不展示置信度、人工答案或比对结论。JSON 保留包括原始置信度在内的完整自动数据；本地存在同 SHA-256 observation 时，还可保留人工确认和比较字段用于审计。
+
+新增现场图片、维护 metadata、核对自动结果、保持固定 HTML 格式和查找输出文件的完整步骤，统一以 [`docs/user-instrument-batch-runbook.md`](docs/user-instrument-batch-runbook.md) 为准。
 
 ## 五张图片的正式结果
 
@@ -119,7 +175,7 @@ python regression_report.py --device all --warmup 5 --runs 20
 输出：
 
 - `output/regression-report.html`：自包含 HTML，含原图缩略图、识别可视化、Level 1/2/3 和各项延迟；
-- `output/regression-report.json`：同次执行的可审计原始数据；
+- `output/regression-report.json`：同次执行的可审计原始数据；匹配到类型时同时记录原始视觉读数、业务读数、类型 ID、通道 ID 和解释方法；
 - `output/regression-report-assets/`：CPU/MPS 标注图片。
 
 模型按设备各加载一次，加载时间单列且不计入 steady-state；每张图片仍独立 warm-up 至少 5 次、正式执行至少 20 次。
@@ -147,8 +203,8 @@ T_steady = T_preprocess + T_inference + T_postprocess
 
 ```bash
 python -m unittest discover -s tests -v
-uvx ruff check src benchmark.py regression_report.py tests
-uvx ty check src benchmark.py regression_report.py
+uvx ruff check src benchmark.py regression_report.py batch_instrument_report.py tests
+uvx ty check src benchmark.py regression_report.py batch_instrument_report.py
 ```
 
 ## 模型来源

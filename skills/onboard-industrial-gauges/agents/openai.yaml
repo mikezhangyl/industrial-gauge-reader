@@ -1,0 +1,4 @@
+interface:
+  display_name: "工业仪表类型接入"
+  short_description: "先确认读取范围，再分层接入、验证并报告新的工业仪表类型"
+  default_prompt: "Use $onboard-industrial-gauges to confirm the readout scope and onboard these new industrial gauge images."
