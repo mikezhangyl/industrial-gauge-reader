@@ -272,6 +272,48 @@ class BatchInstrumentReportTests(unittest.TestCase):
         self.assertNotIn("最终复核值", report)
         self.assertNotIn("<th>比对</th>", report)
 
+    def test_html_labels_metadata_free_result_as_generic_pointer_gauge(self):
+        payload = {
+            "automated_summary": {
+                "images": 1,
+                "instrument_types_recognized": 0,
+                "channels": 1,
+                "recognized": 1,
+                "ambiguous": 0,
+                "not_recognized": 0,
+                "analysis_failures": 0,
+            },
+            "records": [
+                {
+                    "image": "unknown-gauge.jpg",
+                    "instrument_type_id": None,
+                    "analysis_failure_reason": None,
+                    "detections": [],
+                    "channels": [
+                        {
+                            "instance_id": "instance_1",
+                            "channel_id": "pointer_reading",
+                            "automated": {
+                                "value": 2.62,
+                                "candidates": [],
+                                "unit": "unknown",
+                                "status": "recognized",
+                                "method": "generic:analog_pointer",
+                                "raw_display": None,
+                                "raw_ocr_text": None,
+                                "note_zh": "未匹配类型 metadata；已保留通用指针读数。",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+        report = render_html(payload)
+
+        self.assertIn("通用指针仪表（metadata 未匹配）", report)
+        self.assertNotIn('<p class="failure-note">', report)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,8 +8,8 @@
 
 1. 每张输入图片在 JSON 中有一个 `record`，在 HTML 中有一个对应图片卡片，顺序与命令行输入一致。
 2. HTML 可以脱离原始临时图片打开，并只展示原图及本次程序产生的结果、状态、方法、原始显示和说明。
-3. JSON 包含 `automated_summary`，并分别统计识别到的仪表类型、程序通道、成功、候选、未识别和图片级失败。
-4. 未唯一匹配仪表类型或未识别通道时，HTML 和 JSON 明确显示失败，不补入人工猜测值。
+3. JSON 包含 `automated_summary`，并分别统计匹配到的类型 metadata、程序通道、成功、候选、未识别和图片级失败。
+4. 未唯一匹配类型 metadata 时继续执行通用指针读取，并将类型和未知单位明确标记；只有表盘检测等视觉分析失败时才记录图片级失败，不补入人工猜测值。
 5. `output/` 中同时存在同名 `.json` 和 `.html`，HTML 中内嵌图片数与输入图片数一致。
 6. 每条 JSON 记录包含原图 SHA-256、原图/分析图尺寸、检测框和运行环境指纹，可用于两台机器对比。
 7. 相关测试、Ruff、类型检查和 `git diff --check` 通过。交付结论写成“当前验证未发现回归”。
@@ -49,7 +49,7 @@ uv pip install -r requirements.txt
 
 先检查 `metadata/instrument-types/` 是否已有匹配类型。新类型以现有目录为结构示例新增 `metadata.json`；已有类型只补充经过核验的通道、解释规则或证据。
 
-程序依靠整图 OCR 唯一匹配类型 metadata。没有唯一匹配时，报告应显示图片级失败；先补齐可核验的类型知识，再重新运行。
+程序利用整图 OCR 尝试唯一匹配类型 metadata。metadata 是可选的结果增强：命中后补充仪表类型、业务通道、单位、量程和专业解释；没有唯一匹配时必须回退到通用指针读取，保留能够从表盘视觉直接得到的读数，并把类型或单位标为未知。不能仅因缺少 metadata 将图片判为失败。
 
 ### 3. 运行固定自动报告
 
@@ -109,7 +109,7 @@ open output/iter2/instrument-report.html
 
 依次检查：
 
-- `instrument_types_recognized` 是否覆盖预期图片；
+- `instrument_types_recognized` 表示匹配到类型 metadata 的图片数；未命中 metadata 的通用读数仍应出现在程序通道中；
 - `recognized`、`ambiguous`、`not_recognized` 和 `analysis_failures`；
 - `records[].channels[].automated` 中的值、候选、状态、方法、原始 OCR 和说明；置信度只在 JSON 中保留供技术审计；
 - `records[].detections` 是否包含程序检测到的仪表框；

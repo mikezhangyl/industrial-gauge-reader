@@ -1,9 +1,15 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 
+from src.gauge_reader import GaugeResult, StageTimings
 from src.instrument_image import (
+    MetadataAwareImageAnalyzer,
+    _generic_pointer_analysis,
     _select_similar_dial_row,
     extract_counter_candidates,
     has_generated_visualization_overlay,
@@ -13,6 +19,73 @@ from src.rapidocr_reader import DialCandidate, deduplicate_dial_candidates
 
 
 class InstrumentImageTests(unittest.TestCase):
+    def test_missing_metadata_falls_back_to_generic_pointer_reading(self):
+        result = GaugeResult(
+            detected=True,
+            bbox=(10, 10, 90, 90),
+            detection_confidence=0.9,
+            pointer_found=True,
+            center=(50.0, 50.0),
+            pointer_tip=(50.0, 10.0),
+            angle_degrees=0.0,
+            sweep_fraction=0.25,
+            reading=2.62,
+            unit=None,
+            confidence=0.85,
+            center_method="model-segmentation",
+            timings=StageTimings(1.0, 2.0, 3.0),
+        )
+        reader = SimpleNamespace(
+            ocr=lambda image: SimpleNamespace(txts=("unknown gauge",), scores=(0.9,)),
+            detect_dial_candidates=lambda path: (),
+            read=lambda path, visible_text_context=None: result,
+        )
+        catalog = SimpleNamespace(find=lambda visible_text: ())
+        with TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "unknown-gauge.png"
+            self.assertTrue(
+                cv2.imwrite(str(image_path), np.zeros((100, 100, 3), dtype=np.uint8))
+            )
+
+            analysis = MetadataAwareImageAnalyzer(reader, catalog).analyze(image_path)
+
+        self.assertIsNone(analysis.instrument_type_id)
+        self.assertIsNone(analysis.failure_reason)
+        self.assertEqual(analysis.instances, ("instance_1",))
+        self.assertEqual(len(analysis.channels), 1)
+        self.assertEqual(analysis.channels[0].channel_id, "pointer_reading")
+        self.assertEqual(analysis.channels[0].value, 2.62)
+        self.assertEqual(analysis.channels[0].status, "recognized")
+
+    def test_generic_detected_gauge_without_scale_is_a_channel_failure(self):
+        result = GaugeResult(
+            detected=True,
+            bbox=(10, 10, 90, 90),
+            detection_confidence=0.8,
+            pointer_found=True,
+            center=(50.0, 50.0),
+            pointer_tip=(20.0, 20.0),
+            angle_degrees=315.0,
+            sweep_fraction=None,
+            reading=None,
+            unit=None,
+            confidence=0.7,
+            center_method="model-segmentation",
+            timings=StageTimings(1.0, 2.0, 3.0),
+            failure_reason="OCR found only 0 numeric scale candidates",
+        )
+
+        analysis = _generic_pointer_analysis(
+            "a" * 64,
+            "unknown gauge",
+            result,
+            metadata_match_count=0,
+        )
+
+        self.assertIsNone(analysis.failure_reason)
+        self.assertEqual(analysis.channels[0].status, "not_recognized")
+        self.assertIsNone(analysis.channels[0].value)
+
     def test_generated_visualization_overlay_is_rejected_despite_ocr_noise(self):
         for visible_text in (
             "Pointer angle: 34.48 deg Sweep position: N/A Reading: N/A",

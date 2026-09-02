@@ -51,14 +51,15 @@ Do not start behavioral implementation until the scope is confirmed. Type metada
 
 Run the current automated pipeline on the original image before changing anything. Preserve the baseline JSON or terminal output and classify the earliest failure:
 
-1. instrument type was not uniquely matched;
-2. dial or display region was not detected;
-3. pointer, counter, or status element was not extracted;
-4. geometry or scale mapping failed;
-5. the visual value was found but its business meaning was wrong;
-6. the value was correct but the report included out-of-scope channels.
+1. dial or display region was not detected;
+2. pointer, counter, or status element was not extracted;
+3. geometry or scale mapping failed;
+4. the visual value was found but optional metadata enrichment was unavailable or wrong;
+5. the value was correct but the report included out-of-scope channels.
 
 Use the earliest failing boundary to choose the change. Do not infer the cause only from the final HTML status.
+
+Type metadata is optional enrichment, never a visual-analysis gate. When no unique type matches, the batch pipeline must continue with the generic pointer reader, retain any visually supported reading, and mark unknown type, unit, or business semantics explicitly. Record an image-level failure only when the visual pipeline itself cannot analyze the instrument.
 
 ## 3. Choose the smallest reusable extension
 
@@ -66,7 +67,7 @@ Use this order:
 
 ### Metadata-only
 
-Add or amend a type knowledge bundle when existing visual primitives work and the gap is the model marking, channel meaning, unit, scale, allowed value, normalization, or evidence source.
+Add or amend a type knowledge bundle when existing visual primitives already return a useful generic result and the remaining gap is the model marking, channel meaning, unit, scale, allowed value, normalization, or evidence source. The same image must remain generically readable when that metadata bundle is absent.
 
 ### Reusable program capability
 
@@ -97,6 +98,7 @@ Examples of semantic separation:
 Add a targeted regression test at the boundary being extended, then run the original image again. Verify all of the following:
 
 - every confirmed in-scope instance/channel appears once;
+- images without matching metadata retain generic pointer channels rather than becoming image-level failures;
 - excluded channels are absent from the current report scope;
 - ambiguous scales remain candidates rather than invented single values;
 - source images are embedded in the HTML;

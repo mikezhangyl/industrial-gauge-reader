@@ -125,27 +125,21 @@ class MetadataAwareImageAnalyzer:
                 channels=(),
                 failure_reason=GENERATED_VISUALIZATION_FAILURE,
             )
-        dial_candidates = self.reader.detect_dial_candidates(image_path)
         matches = self.catalog.find(visible_text)
         if len(matches) != 1:
-            detected_results = tuple(
-                _empty_pointer_result(candidate) for candidate in dial_candidates[:5]
+            generic_result = self.reader.read(
+                image_path,
+                visible_text_context=visible_text,
             )
-            return InstrumentImageAnalysis(
-                image_sha256=image_sha256,
-                instrument_type_id=None,
-                visible_text=visible_text,
-                instances=(),
-                pointer_results=detected_results,
-                channels=(),
-                failure_reason=(
-                    "No unique instrument type matched full-image OCR"
-                    if not matches
-                    else "Multiple instrument types matched full-image OCR"
-                ),
+            return _generic_pointer_analysis(
+                image_sha256,
+                visible_text,
+                generic_result,
+                metadata_match_count=len(matches),
             )
 
         metadata = matches[0]
+        dial_candidates = self.reader.detect_dial_candidates(image_path)
         counters = extract_counter_candidates(full_ocr, image)
         mechanical_channels = tuple(
             channel
@@ -242,6 +236,60 @@ class MetadataAwareImageAnalyzer:
                 key=lambda result: result.bbox[0] if result.bbox is not None else 0,
             )
         )
+
+
+def _generic_pointer_analysis(
+    image_sha256: str,
+    visible_text: str,
+    result: GaugeResult,
+    *,
+    metadata_match_count: int,
+) -> InstrumentImageAnalysis:
+    """Keep the generic visual reading when optional type metadata is unavailable."""
+    if not result.detected:
+        return InstrumentImageAnalysis(
+            image_sha256=image_sha256,
+            instrument_type_id=None,
+            visible_text=visible_text,
+            instances=(),
+            pointer_results=(result,),
+            channels=(),
+            failure_reason=result.failure_reason or "Generic gauge detection failed",
+        )
+
+    if result.reading is not None:
+        status = "recognized"
+    elif result.reading_candidates:
+        status = "ambiguous"
+    else:
+        status = "not_recognized"
+    metadata_note = (
+        "未匹配类型 metadata；已保留通用指针读数。"
+        if metadata_match_count == 0
+        else "匹配到多个类型 metadata；已保留通用指针读数，未猜测具体类型。"
+    )
+    channel = ChannelAnalysis(
+        instance_id="instance_1",
+        channel_id="pointer_reading",
+        value=result.reading,
+        unit=result.unit or "unknown",
+        status=status,
+        method=result.interpretation_method or "generic:analog_pointer",
+        confidence=result.confidence,
+        raw_display=(
+            str(result.raw_reading) if result.raw_reading is not None else None
+        ),
+        candidates=tuple(result.reading_candidates),
+        note_zh=metadata_note,
+    )
+    return InstrumentImageAnalysis(
+        image_sha256=image_sha256,
+        instrument_type_id=None,
+        visible_text=visible_text,
+        instances=("instance_1",),
+        pointer_results=(result,),
+        channels=(channel,),
+    )
 
 
 def has_generated_visualization_overlay(visible_text: str) -> bool:
