@@ -3,17 +3,34 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import gc
+import hashlib
 import html
+import importlib.metadata
 import json
-import mimetypes
+import platform
+import subprocess
+import sys
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
-from src.instrument_image import POINTER_DISPLAY_TYPES, MetadataAwareImageAnalyzer
+from src.batch_io import (
+    NORMALIZED_MAX_EDGE,
+    NormalizedBatchImage,
+    annotated_preview_data_uri,
+    default_report_path,
+    discover_input_images,
+    normalize_batch_images,
+    preview_crop_bbox,
+)
+from src.instrument_image import (
+    GENERATED_VISUALIZATION_FAILURE,
+    POINTER_DISPLAY_TYPES,
+    MetadataAwareImageAnalyzer,
+)
 from src.instrument_metadata import InstrumentMetadataCatalog, ReadoutChannel
 from src.instrument_observations import (
     ConfirmedReadout,
@@ -30,12 +47,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run metadata-aware automated analysis over instrument images"
     )
-    parser.add_argument("images", nargs="+", type=Path)
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        type=Path,
+        help="One image directory, or an ordered list of image files",
+    )
     parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / "output/user-instrument-batch.json",
+        default=None,
+        help=(
+            "JSON output path; HTML is written beside it with the same stem. "
+            "A directory input defaults to output/<directory>/instrument-report.*"
+        ),
     )
     parser.add_argument(
         "--require-pointer-match",
@@ -46,9 +72,11 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
-    missing = [str(path) for path in args.images if not path.is_file()]
-    if missing:
-        parser.error(f"Input images do not exist: {missing}")
+    try:
+        image_paths, input_directory = discover_input_images(args.inputs)
+    except ValueError as error:
+        parser.error(str(error))
+    output_path = args.output or default_report_path(PROJECT_ROOT, input_directory)
 
     metadata_catalog = InstrumentMetadataCatalog.load()
     observation_catalog = InstrumentObservationCatalog.load(metadata_catalog)
@@ -60,42 +88,75 @@ def main() -> int:
         reading_interpreter=InstrumentReadingInterpreter(metadata_catalog),
     )
     analyzer = MetadataAwareImageAnalyzer(reader, metadata_catalog)
-    records = [
-        evaluate_image(
-            image_path,
-            analyzer,
-            metadata_catalog,
-            observation_catalog,
+    with TemporaryDirectory(prefix="instrument-batch-normalized-") as temp_dir:
+        normalized_images = normalize_batch_images(
+            image_paths,
+            Path(temp_dir),
+            max_edge=NORMALIZED_MAX_EDGE,
         )
-        for image_path in args.images
-    ]
+        records = [
+            evaluate_image(
+                batch_image,
+                analyzer,
+                metadata_catalog,
+                observation_catalog,
+            )
+            for batch_image in normalized_images
+        ]
+        pointer_acceptance = summarize_pointer_acceptance(records, metadata_catalog)
+        automated_summary = summarize_automated(records)
+        payload = {
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "device": args.device,
+            "input_contract": {
+                "mode": "directory" if input_directory is not None else "files",
+                "batch_name": input_directory.name
+                if input_directory is not None
+                else None,
+                "image_order": [path.name for path in image_paths],
+                "normalization": {
+                    "exif_orientation": True,
+                    "color_mode": "RGB",
+                    "maximum_edge_pixels": NORMALIZED_MAX_EDGE,
+                    "analysis_format": "PNG",
+                },
+            },
+            "runtime": runtime_fingerprint(models),
+            "separation_rule": (
+                "Automated results remain independent; user-confirmed values own the "
+                "final reviewed value and never become model input."
+            ),
+            "summary": summarize(records),
+            "automated_summary": automated_summary,
+            "pointer_acceptance": pointer_acceptance,
+            "records": records,
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        html_path = output_path.with_suffix(".html")
+        html_path.write_text(render_html(payload, normalized_images), encoding="utf-8")
+    reader.close()
     del analyzer
     del reader
     gc.collect()
-    pointer_acceptance = summarize_pointer_acceptance(records, metadata_catalog)
-    automated_summary = summarize_automated(records)
-    payload = {
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "device": args.device,
-        "separation_rule": (
-            "Automated results remain independent; user-confirmed values own the "
-            "final reviewed value and never become model input."
-        ),
-        "summary": summarize(records),
-        "automated_summary": automated_summary,
-        "pointer_acceptance": pointer_acceptance,
-        "records": records,
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    html_path = args.output.with_suffix(".html")
-    html_path.write_text(render_html(payload, args.images), encoding="utf-8")
     print(json.dumps(automated_summary, ensure_ascii=False, indent=2))
-    print(f"JSON: {args.output}")
-    print(f"HTML: {html_path}")
+    if input_directory is not None:
+        print(f"Input directory: {input_directory.resolve()}")
+    print(f"JSON: {output_path.resolve()}")
+    print(f"HTML: {html_path.resolve()}")
+    rejected_visualizations = [
+        record["image"]
+        for record in records
+        if record["analysis_failure_reason"] == GENERATED_VISUALIZATION_FAILURE
+    ]
+    if rejected_visualizations:
+        print("Rejected generated visualization images; use original photos:")
+        for image_name in rejected_visualizations:
+            print(f"- {image_name}")
+        return 2
     if (
         args.require_pointer_match
         and not pointer_acceptance["reviewed_pointer_channels"]
@@ -114,13 +175,13 @@ def main() -> int:
 
 
 def evaluate_image(
-    image_path: Path,
+    batch_image: NormalizedBatchImage,
     analyzer: MetadataAwareImageAnalyzer,
     metadata_catalog: InstrumentMetadataCatalog,
     observation_catalog: InstrumentObservationCatalog,
 ) -> dict[str, Any]:
-    analysis = analyzer.analyze(image_path)
-    observation = observation_catalog.for_image(image_path)
+    analysis = analyzer.analyze(batch_image.analysis_path)
+    observation = observation_catalog.for_image(batch_image.source_path)
     automated_by_key = {
         (channel.instance_id, channel.channel_id): channel
         for channel in analysis.channels
@@ -157,9 +218,14 @@ def evaluate_image(
                 "final": final_value(automated, confirmed),
             }
         )
+    detections = _serialize_detections(analysis, batch_image.normalized_size)
     return {
-        "image": image_path.name,
-        "image_sha256": analysis.image_sha256,
+        "image": batch_image.source_path.name,
+        "image_sha256": batch_image.source_sha256,
+        "normalized_image_sha256": analysis.image_sha256,
+        "source_dimensions": list(batch_image.source_size),
+        "oriented_dimensions": list(batch_image.oriented_size),
+        "analysis_dimensions": list(batch_image.normalized_size),
         "instrument_type_id": analysis.instrument_type_id,
         "expected_instrument_type_id": (
             observation.instrument_type_id if observation is not None else None
@@ -171,8 +237,145 @@ def evaluate_image(
         ),
         "observation_id": observation.observation_id if observation else None,
         "analysis_failure_reason": analysis.failure_reason,
+        "detections": detections,
+        "preview_crop_bbox": list(
+            preview_crop_bbox(detections, batch_image.normalized_size)
+        ),
         "channels": channel_records,
     }
+
+
+def _serialize_detections(
+    analysis: Any,
+    image_size: tuple[int, int],
+) -> list[dict[str, Any]]:
+    detections: list[dict[str, Any]] = []
+    for index, result in enumerate(analysis.pointer_results):
+        if not result.detected or result.bbox is None:
+            continue
+        detector_bbox = tuple(int(value) for value in result.bbox)
+        bbox = detector_bbox
+        bbox_method = "detector"
+        if (
+            result.center_method is not None
+            and "pointer-aligned-outer-label-ocr" in result.center_method
+        ):
+            bbox = _concentric_outer_label_bbox(result, image_size)
+            bbox_method = "concentric_outer_label"
+        instance_id = (
+            analysis.instances[index]
+            if index < len(analysis.instances)
+            else f"instance_{index + 1}"
+        )
+        detections.append(
+            {
+                "instance_id": instance_id,
+                "bbox": list(bbox),
+                "detector_bbox": list(detector_bbox),
+                "bbox_method": bbox_method,
+                "pointer_found": result.pointer_found,
+                "center": list(result.center) if result.center is not None else None,
+                "pointer_tip": (
+                    list(result.pointer_tip) if result.pointer_tip is not None else None
+                ),
+                "angle_degrees": result.angle_degrees,
+                "detection_confidence": result.detection_confidence,
+            }
+        )
+    return detections
+
+
+def _concentric_outer_label_bbox(
+    result: Any,
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Expand an inner-dial detection to include its concentric OCR label ring."""
+    if result.bbox is None:
+        raise ValueError("Outer-label display region requires a detector bbox")
+    x1, y1, x2, y2 = (int(value) for value in result.bbox)
+    center_x, center_y = (
+        result.center if result.center is not None else ((x1 + x2) / 2, (y1 + y2) / 2)
+    )
+    inner_dial_size = max(x2 - x1, y2 - y1)
+    outer_extent = inner_dial_size * 1.20
+    image_width, image_height = image_size
+    return (
+        max(0, round(center_x - outer_extent)),
+        max(0, round(center_y - outer_extent)),
+        min(image_width, round(center_x + outer_extent)),
+        min(image_height, round(center_y + outer_extent)),
+    )
+
+
+def runtime_fingerprint(models: dict[str, Path]) -> dict[str, Any]:
+    """Record enough runtime identity to compare two machines."""
+    packages = {}
+    for package in (
+        "numpy",
+        "opencv-python",
+        "onnxruntime",
+        "rapidocr",
+        "torch",
+        "torchvision",
+        "ultralytics",
+        "pillow",
+    ):
+        try:
+            packages[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            packages[package] = None
+    try:
+        git_commit = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT.parent), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        git_worktree_dirty = bool(
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(PROJECT_ROOT.parent),
+                    "status",
+                    "--porcelain",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.SubprocessError):
+        git_commit = None
+        git_worktree_dirty = None
+    return {
+        "git_commit": git_commit,
+        "git_worktree_dirty": git_worktree_dirty,
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "packages": packages,
+        "models": {
+            name: {
+                "filename": path.name,
+                "sha256": _file_sha256(path),
+                "bytes": path.stat().st_size,
+            }
+            for name, path in sorted(models.items())
+        },
+        "executable_name": Path(sys.executable).name,
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def compare_channel(
@@ -319,7 +522,10 @@ def summarize_pointer_acceptance(
     }
 
 
-def render_html(payload: dict[str, Any], image_paths: list[Path] | None = None) -> str:
+def render_html(
+    payload: dict[str, Any],
+    normalized_images: list[NormalizedBatchImage] | None = None,
+) -> str:
     summary = payload.get("automated_summary") or summarize_automated(
         payload["records"]
     )
@@ -358,16 +564,25 @@ def render_html(payload: dict[str, Any], image_paths: list[Path] | None = None) 
                 '<td colspan="4">程序未识别到可报告通道</td>'
                 "</tr>"
             )
-        image_path = (
-            image_paths[index]
-            if image_paths is not None and index < len(image_paths)
+        batch_image = (
+            normalized_images[index]
+            if normalized_images is not None and index < len(normalized_images)
             else None
         )
         image_markup = (
-            f'<img src="{_image_data_uri(image_path)}" '
+            f'<img src="{annotated_preview_data_uri(batch_image.analysis_path, record.get("detections", []))}" '
             f'alt="{html.escape(record["image"])}">'
-            if image_path is not None and image_path.is_file()
+            if batch_image is not None and batch_image.analysis_path.is_file()
             else '<div class="image-missing">未提供可嵌入的原图</div>'
+        )
+        source_dimensions = record.get("source_dimensions") or []
+        analysis_dimensions = record.get("analysis_dimensions") or []
+        dimension_markup = (
+            f'<p class="dimensions">原图 {source_dimensions[0]}×{source_dimensions[1]} · '
+            f"分析图 {analysis_dimensions[0]}×{analysis_dimensions[1]} · "
+            f"检测框 {len(record.get('detections', []))}</p>"
+            if len(source_dimensions) == 2 and len(analysis_dimensions) == 2
+            else ""
         )
         instrument_type = record.get("instrument_type_id") or "未识别"
         failure_reason = record.get("analysis_failure_reason")
@@ -381,6 +596,8 @@ def render_html(payload: dict[str, Any], image_paths: list[Path] | None = None) 
             '<div class="image-panel">'
             f"{image_markup}"
             f'<p class="filename">{html.escape(record["image"])}</p>'
+            f"{dimension_markup}"
+            '<p class="preview-note">绿色框为本次程序检测到的仪表区域；预览按检测区域裁剪，输入文件未修改。</p>'
             "</div>"
             '<div class="data-panel">'
             f"<h2>图片 {index + 1}</h2>"
@@ -405,8 +622,9 @@ h1{{margin:0 0 8px}} h2{{margin:0 0 8px;font-size:20px}}
 .summary .primary{{background:#e8f5ec;border-color:#90c69f;font-weight:650}}
 .summary .failure{{background:#fff4e6;border-color:#e9bb77}}
 .report-card{{display:grid;grid-template-columns:minmax(300px,.9fr) minmax(0,1.35fr);gap:24px;background:#fff;border:1px solid #d8ded9;border-radius:14px;padding:20px;margin:0 0 24px;box-shadow:0 2px 8px #17221d12}}
-.image-panel img{{display:block;width:100%;max-height:620px;object-fit:contain;background:#eef1ee;border-radius:8px}}
+.image-panel img{{display:block;width:100%;aspect-ratio:3/2;object-fit:contain;background:#eef1ee;border-radius:8px}}
 .filename{{font-size:12px;color:#65736b;overflow-wrap:anywhere;margin:10px 0 0}}
+.dimensions,.preview-note{{font-size:12px;color:#65736b;margin:5px 0 0;line-height:1.45}}
 .image-missing{{display:grid;place-items:center;min-height:220px;background:#eef1ee;color:#65736b;border-radius:8px}}
 .instrument-type{{margin:0 0 16px;color:#405047}} code{{font-size:13px}}
 .failure-note{{padding:9px 12px;background:#fff0d8;color:#80520c;border-radius:7px}}
@@ -421,7 +639,7 @@ th{{background:#eef3ef}} .status{{display:inline-block;padding:2px 7px;border-ra
 .status-not_recognized .status{{background:#fde2df;color:#902d25}}
 @media (max-width:900px){{main{{padding:18px}}.report-card{{grid-template-columns:1fr}}}}
 </style></head><body><main><h1>仪表自动识别报告</h1>
-<p class="note">每张图片的结果均来自本次程序运行。</p>
+<p class="note">每张图片均经过 EXIF 方向校正和最长边 {NORMALIZED_MAX_EDGE}px 归一化；绿色框与读数来自本次程序运行。</p>
 <div class="summary"><div>图片 {summary["images"]}</div>
 <div>识别到仪表类型 {summary["instrument_types_recognized"]}/{summary["images"]}</div>
 <div>程序识别通道 {summary["channels"]}</div>
@@ -430,12 +648,6 @@ th{{background:#eef3ef}} .status{{display:inline-block;padding:2px 7px;border-ra
 <div class="{"failure" if summary["not_recognized"] else ""}">未识别 {summary["not_recognized"]}</div>
 <div class="{"failure" if summary["analysis_failures"] else ""}">图片级失败 {summary["analysis_failures"]}</div></div>
 {"".join(cards)}</main></body></html>"""
-
-
-def _image_data_uri(image_path: Path) -> str:
-    mime_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
-    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
 
 
 def _automated_status_label(status: str) -> str:

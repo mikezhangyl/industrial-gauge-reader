@@ -8,6 +8,8 @@
 
 任务只有在运行手册的完成条件全部满足后才算完成。交付时应直接给出本次生成的 HTML 和 JSON 文件路径，并说明程序识别成功、候选、未识别和图片级失败的数量。
 
+批次默认以一个只包含原始、未标注现场照片的目录作为输入，运行 `python batch_instrument_report.py input/<batch-name>`；不要把 `output/result*.jpg` 等已画框、画箭头或写入读数的派生图放回输入目录，也不要另写临时汇总脚本。程序生成 `output/<batch-name>/instrument-report.html` 和同名 JSON，并在终端打印绝对路径；检测到本项目生成的可视化覆盖层时必须拒绝分析并返回非零退出码。
+
 用户现场图片、`observations/` 和 `output/` 是本地隐私数据；保持现有 `.gitignore` 边界。仪表类型专业知识写入 `metadata/instrument-types/`。新图自动报告不要求人工 observation；只有用户提供确认值并要求标注回归时，才将确认值写入 `observations/`。
 
 ## 其他子项目

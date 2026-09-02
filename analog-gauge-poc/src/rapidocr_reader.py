@@ -620,11 +620,17 @@ class EthzPaddleGaugeReader:
         self.last_ring: np.ndarray | None = None
         self._visible_text_cache: dict[tuple[str, int, int], str] = {}
 
-    @staticmethod
-    def recognize_isolated_text_lines(crops: list[np.ndarray]) -> object:
-        """Keep specialized OCR batches from mutating the main OCR session state."""
-        isolated_ocr = RapidOCR(params=RAPIDOCR_PARAMS)
-        return isolated_ocr.recognize_txt(crops)
+    def recognize_isolated_text_lines(self, crops: list[np.ndarray]) -> object:
+        """Reuse the bounded resident OCR session for specialized text crops."""
+        return self.ocr.recognize_txt(crops)
+
+    def close(self) -> None:
+        """Release ONNX Runtime sessions before interpreter shutdown."""
+        for component_name in ("text_det", "text_cls", "text_rec"):
+            component = getattr(self.ocr, component_name, None)
+            session_holder = getattr(component, "session", None)
+            if session_holder is not None and hasattr(session_holder, "session"):
+                session_holder.session = None
 
     def _interpret_result(self, result: GaugeResult, visible_text: str) -> GaugeResult:
         if self.reading_interpreter is None:

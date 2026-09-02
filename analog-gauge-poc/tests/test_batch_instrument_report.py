@@ -1,13 +1,19 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+
+from PIL import Image
 
 from batch_instrument_report import (
+    _serialize_detections,
     compare_channel,
     render_html,
     summarize_automated,
     summarize_pointer_acceptance,
 )
+from src.batch_io import NormalizedBatchImage
+from src.gauge_reader import GaugeResult, StageTimings
 from src.instrument_image import ChannelAnalysis
 from src.instrument_metadata import InstrumentMetadataCatalog
 from src.instrument_observations import ConfirmedReadout
@@ -44,6 +50,37 @@ class BatchInstrumentReportTests(unittest.TestCase):
         )
 
         self.assertEqual(compare_channel(automated, confirmed, channel), "match")
+
+    def test_outer_label_dial_report_box_includes_the_numeric_ring(self):
+        result = GaugeResult(
+            detected=True,
+            bbox=(469, 557, 677, 761),
+            detection_confidence=0.48,
+            pointer_found=True,
+            center=(580.3, 654.3),
+            pointer_tip=(528.1, 605.8),
+            angle_degrees=312.9,
+            sweep_fraction=None,
+            reading="4",
+            unit="tap_position",
+            confidence=0.48,
+            center_method=("keypoints+pointer-aligned-outer-label-ocr"),
+            timings=StageTimings(0.0, 0.0, 0.0),
+        )
+        analysis = SimpleNamespace(
+            instances=("instance_1",),
+            pointer_results=(result,),
+        )
+
+        detection = _serialize_detections(analysis, (1280, 1707))[0]
+
+        self.assertEqual(detection["detector_bbox"], [469, 557, 677, 761])
+        self.assertEqual(detection["bbox_method"], "concentric_outer_label")
+        x1, y1, x2, y2 = detection["bbox"]
+        self.assertLessEqual(x1, 410)
+        self.assertLessEqual(y1, 440)
+        self.assertGreaterEqual(x2, 760)
+        self.assertGreaterEqual(y2, 780)
 
     def test_counter_ocr_mismatch_is_not_hidden_by_human_confirmation(self):
         automated = ChannelAnalysis(
@@ -176,6 +213,14 @@ class BatchInstrumentReportTests(unittest.TestCase):
             "records": [
                 {
                     "image": "meter.jpg",
+                    "source_dimensions": [1200, 800],
+                    "analysis_dimensions": [1200, 800],
+                    "detections": [
+                        {
+                            "instance_id": "instance_1",
+                            "bbox": [200, 100, 700, 650],
+                        }
+                    ],
                     "instrument_type_id": "shm_d_motor_drive_unit",
                     "analysis_failure_reason": None,
                     "channels": [
@@ -200,9 +245,17 @@ class BatchInstrumentReportTests(unittest.TestCase):
         }
         with TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "meter.jpg"
-            image_path.write_bytes(b"\xff\xd8embedded-image\xff\xd9")
+            Image.new("RGB", (1200, 800), "white").save(image_path)
+            normalized = NormalizedBatchImage(
+                source_path=image_path,
+                analysis_path=image_path,
+                source_sha256="a" * 64,
+                source_size=(1200, 800),
+                oriented_size=(1200, 800),
+                normalized_size=(1200, 800),
+            )
 
-            report = render_html(payload, [image_path])
+            report = render_html(payload, [normalized])
 
         self.assertIn("data:image/jpeg;base64,", report)
         self.assertIn("meter.jpg", report)
@@ -211,6 +264,8 @@ class BatchInstrumentReportTests(unittest.TestCase):
         self.assertIn("识别成功", report)
         self.assertIn("metadata:discrete_pointer_label", report)
         self.assertIn("程序识别通道 1", report)
+        self.assertIn("检测框 1", report)
+        self.assertIn("绿色框", report)
         self.assertNotIn("置信度", report)
         self.assertNotIn("87.0%", report)
         self.assertNotIn("人工确认", report)

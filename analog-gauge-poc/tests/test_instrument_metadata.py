@@ -78,6 +78,16 @@ class InstrumentMetadataTests(unittest.TestCase):
         self.assertIn("短粗块是指针配重", rules)
         self.assertIn("不得把 3.4/10 直接解释", rules)
 
+    def test_oil_level_indicator_matches_common_ocr_confusion(self):
+        matches = self.catalog.find(
+            "Shandong Taikai Power Electronic KEOI MAX 油位计 OIL-LEY MIN"
+        )
+
+        self.assertEqual(
+            [item.type_id for item in matches],
+            ["transformer_pointer_oil_level_indicator"],
+        )
+
     def test_shm_d_separates_position_status_and_operation_count(self):
         metadata = self.catalog.find("SHM-D Motor drive unit")[0]
         position = metadata.channel("tap_position")
