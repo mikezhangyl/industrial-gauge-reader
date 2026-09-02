@@ -6,6 +6,7 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -21,6 +22,7 @@ from src.instrument_metadata import (
 from src.rapidocr_reader import (
     DialCandidate,
     EthzPaddleGaugeReader,
+    pointer_center_and_tip,
     visible_text_from_ocr_result,
 )
 
@@ -47,6 +49,15 @@ POINTER_DISPLAY_TYPES = frozenset(
         "discrete_pointer_dial",
         "single_pointer_circular_counter",
     }
+)
+GENERATED_VISUALIZATION_FAILURE = (
+    "Input image contains a generated gauge visualization overlay; "
+    "use the original unannotated photo"
+)
+_GENERATED_OVERLAY_TOKEN_GROUPS = (
+    ("pointer", "angle"),
+    ("sweep", "position"),
+    ("reading",),
 )
 
 
@@ -104,14 +115,28 @@ class MetadataAwareImageAnalyzer:
         image_sha256 = hashlib.sha256(image_path.read_bytes()).hexdigest()
         full_ocr = self.reader.ocr(image)
         visible_text = visible_text_from_ocr_result(full_ocr)
-        matches = self.catalog.find(visible_text)
-        if len(matches) != 1:
+        if has_generated_visualization_overlay(visible_text):
             return InstrumentImageAnalysis(
                 image_sha256=image_sha256,
                 instrument_type_id=None,
                 visible_text=visible_text,
                 instances=(),
                 pointer_results=(),
+                channels=(),
+                failure_reason=GENERATED_VISUALIZATION_FAILURE,
+            )
+        dial_candidates = self.reader.detect_dial_candidates(image_path)
+        matches = self.catalog.find(visible_text)
+        if len(matches) != 1:
+            detected_results = tuple(
+                _empty_pointer_result(candidate) for candidate in dial_candidates[:5]
+            )
+            return InstrumentImageAnalysis(
+                image_sha256=image_sha256,
+                instrument_type_id=None,
+                visible_text=visible_text,
+                instances=(),
+                pointer_results=detected_results,
                 channels=(),
                 failure_reason=(
                     "No unique instrument type matched full-image OCR"
@@ -127,9 +152,18 @@ class MetadataAwareImageAnalyzer:
             for channel in metadata.readout_channels
             if channel.display_type == "mechanical_counter"
         )
-        instance_count = len(counters) if mechanical_channels and counters else 1
-        dial_candidates = self.reader.detect_dial_candidates(image_path)
-        selected_dials = _select_instance_dials(dial_candidates, instance_count)
+        if metadata.type_id == "surge_arrester_monitor":
+            selected_dials = _select_similar_dial_row(dial_candidates)
+            if selected_dials:
+                counters = _extract_counters_for_dials(
+                    self.reader,
+                    image,
+                    selected_dials,
+                )
+            instance_count = max(len(selected_dials), 1)
+        else:
+            instance_count = len(counters) if mechanical_channels and counters else 1
+            selected_dials = _select_instance_dials(dial_candidates, instance_count)
         pointer_results = self._read_dials(
             image,
             selected_dials,
@@ -210,6 +244,22 @@ class MetadataAwareImageAnalyzer:
         )
 
 
+def has_generated_visualization_overlay(visible_text: str) -> bool:
+    """Detect this project's rendered debug labels, including noisy OCR variants."""
+    tokens = re.findall(r"[a-z]+", visible_text.casefold())
+    matched_groups = 0
+    for group in _GENERATED_OVERLAY_TOKEN_GROUPS:
+        if all(_has_similar_token(tokens, expected) for expected in group):
+            matched_groups += 1
+    return matched_groups >= 2
+
+
+def _has_similar_token(tokens: list[str], expected: str) -> bool:
+    return any(
+        SequenceMatcher(None, token, expected).ratio() >= 0.72 for token in tokens
+    )
+
+
 def select_meter_hub(
     circles: np.ndarray,
     *,
@@ -266,8 +316,7 @@ def select_meter_pointer_line(
             continue
         line_vector = end - start
         perpendicular_distance = abs(
-            line_vector[0] * (start[1] - hub[1])
-            - line_vector[1] * (start[0] - hub[0])
+            line_vector[0] * (start[1] - hub[1]) - line_vector[1] * (start[0] - hub[0])
         ) / max(float(np.linalg.norm(line_vector)), 1e-6)
         if perpendicular_distance > 0.12 * width:
             continue
@@ -305,6 +354,47 @@ def select_consensus_discrete_label(
     return label, confidence
 
 
+def detect_colored_component_pointer(
+    image: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Recover a red pointer component that crosses the central dial area."""
+    height, width = image.shape[:2]
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    mask = (((hue <= 20) | (hue >= 160)) & (saturation > 30) & (value > 20)).astype(
+        np.uint8
+    )
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    image_center = np.asarray((width / 2.0, height / 2.0))
+    image_area = width * height
+    candidates: list[tuple[float, np.ndarray, np.ndarray, float]] = []
+    for index in range(1, component_count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if not max(40, image_area * 0.002) <= area <= image_area * 0.15:
+            continue
+        component = (labels == index).astype(np.uint8)
+        try:
+            center, tip = pointer_center_and_tip(component)
+        except ValueError:
+            continue
+        length = float(np.linalg.norm(tip - center))
+        center_distance = float(np.linalg.norm(center - image_center))
+        if length < min(width, height) * 0.20:
+            continue
+        if center_distance > min(width, height) * 0.23:
+            continue
+        angle = angle_from_points(center, tip)
+        score = length - center_distance * 0.75 + math.sqrt(area)
+        candidates.append((score, center, tip, angle))
+    if not candidates:
+        raise ValueError("No central colored pointer component")
+    score, center, tip, angle = max(candidates, key=lambda item: item[0])
+    confidence = float(np.clip(0.45 + score / max(width, height) * 0.25, 0.45, 0.8))
+    return center, tip, angle, confidence
+
+
 def _recover_type_specific_pointer_results(
     image: np.ndarray,
     metadata: InstrumentTypeMetadata,
@@ -323,9 +413,7 @@ def _recover_type_specific_pointer_results(
             if existing.reading is not None or existing.reading_candidates:
                 continue
             try:
-                center, tip, angle = _detect_rectangular_meter_pointer(
-                    image, candidate
-                )
+                center, tip, angle = _detect_rectangular_meter_pointer(image, candidate)
             except ValueError:
                 continue
             visual = replace(
@@ -379,9 +467,45 @@ def _recover_type_specific_pointer_results(
                     interpretation_method=None,
                     reading_candidates=(),
                 )
-                recovered[0] = _interpret_recovered_result(
-                    reader, visual, visible_text
+                recovered[0] = _interpret_recovered_result(reader, visual, visible_text)
+
+    if metadata.type_id == "arrester_discharge_counter" and recovered and candidates:
+        existing = recovered[0]
+        channel = _single_pointer_channel(metadata)
+        if existing.reading is None and channel is not None and channel.allowed_values:
+            x1, y1, x2, y2 = candidates[0].bbox
+            try:
+                center, tip, angle, color_confidence = detect_colored_component_pointer(
+                    image[y1:y2, x1:x2]
                 )
+            except ValueError:
+                pass
+            else:
+                step = 360.0 / len(channel.allowed_values)
+                value_index = round(angle / step) % len(channel.allowed_values)
+                raw_value = float(channel.allowed_values[value_index])
+                offset = np.asarray((x1, y1), dtype=np.float64)
+                visual = replace(
+                    existing,
+                    detected=True,
+                    bbox=candidates[0].bbox,
+                    detection_confidence=candidates[0].confidence,
+                    pointer_found=True,
+                    center=tuple(center + offset),
+                    pointer_tip=tuple(tip + offset),
+                    angle_degrees=angle,
+                    reading=raw_value,
+                    unit=None,
+                    confidence=min(candidates[0].confidence, color_confidence),
+                    center_method="type-specific:colored-component-pointer",
+                    failure_reason=None,
+                    raw_reading=None,
+                    instrument_type_id=None,
+                    readout_channel_id=None,
+                    interpretation_method=None,
+                    reading_candidates=(),
+                )
+                recovered[0] = _interpret_recovered_result(reader, visual, visible_text)
     return tuple(recovered)
 
 
@@ -414,19 +538,13 @@ def _detect_rectangular_meter_pointer(
         midpoint_y = float((start[1] + end[1]) / 2.0)
         length = float(np.linalg.norm(end - start))
         if angle <= 15.0 and 0.30 * height <= midpoint_y <= 0.82 * height:
-            horizontal.append(
-                (length, float((start[0] + end[0]) / 2.0), midpoint_y)
-            )
+            horizontal.append((length, float((start[0] + end[0]) / 2.0), midpoint_y))
     if not horizontal:
         raise ValueError("Rectangular meter horizontal boundary was not found")
     face_center_x = max(horizontal, key=lambda item: item[0])[1]
-    lower_boundaries = [
-        item for item in horizontal if item[2] >= 0.65 * height
-    ]
+    lower_boundaries = [item for item in horizontal if item[2] >= 0.65 * height]
     face_bottom_y = (
-        max(lower_boundaries, key=lambda item: item[2])[2]
-        if lower_boundaries
-        else None
+        max(lower_boundaries, key=lambda item: item[2])[2] if lower_boundaries else None
     )
 
     roi_x1, roi_x2 = round(0.20 * width), round(0.70 * width)
@@ -488,9 +606,7 @@ def _recognize_pointer_aligned_discrete_label(
     patch_height = max(28, round(dial_size * 0.30))
     angle = result.angle_degrees
     radians = math.radians(angle)
-    direction = np.asarray(
-        (math.sin(radians), -math.cos(radians)), dtype=np.float64
-    )
+    direction = np.asarray((math.sin(radians), -math.cos(radians)), dtype=np.float64)
     center = np.asarray(result.center, dtype=np.float64)
     signed_angle = (angle + 180.0) % 360.0 - 180.0
     crops: list[np.ndarray] = []
@@ -527,10 +643,7 @@ def _recognize_pointer_aligned_discrete_label(
     if texts is None or scores is None:
         raise ValueError("Pointer-aligned discrete label OCR returned no result")
     return select_consensus_discrete_label(
-        [
-            (str(text), float(score))
-            for text, score in zip(texts, scores, strict=True)
-        ]
+        [(str(text), float(score)) for text, score in zip(texts, scores, strict=True)]
     )
 
 
@@ -599,6 +712,92 @@ def extract_counter_candidates(
             )
         )
     return tuple(sorted(candidates, key=lambda item: item.center[0]))
+
+
+def _select_similar_dial_row(
+    candidates: tuple[DialCandidate, ...],
+) -> tuple[DialCandidate, ...]:
+    """Keep the similarly sized horizontal row anchored by the best detection."""
+    if not candidates:
+        return ()
+    anchor = candidates[0]
+    ax1, ay1, ax2, ay2 = anchor.bbox
+    anchor_width = ax2 - ax1
+    anchor_height = ay2 - ay1
+    anchor_center_y = (ay1 + ay2) / 2.0
+    selected = []
+    for candidate in candidates:
+        x1, y1, x2, y2 = candidate.bbox
+        width = x2 - x1
+        height = y2 - y1
+        if not 0.65 <= width / anchor_width <= 1.45:
+            continue
+        if not 0.65 <= height / anchor_height <= 1.45:
+            continue
+        if abs((y1 + y2) / 2.0 - anchor_center_y) > 0.55 * anchor_height:
+            continue
+        selected.append(candidate)
+    return tuple(sorted(selected, key=lambda item: item.bbox[0]))
+
+
+def _extract_counters_for_dials(
+    reader: EthzPaddleGaugeReader,
+    image: np.ndarray,
+    dials: tuple[DialCandidate, ...],
+) -> tuple[CounterOCRCandidate, ...]:
+    """Read one dark mechanical counter window from the upper part of each dial."""
+    selected: list[CounterOCRCandidate] = []
+    for dial in dials:
+        x1, y1, x2, y2 = dial.bbox
+        dial_height = y2 - y1
+        dial_width = x2 - x1
+        crop_x1 = x1 + round(dial_width * 0.15)
+        crop_x2 = x2 - round(dial_width * 0.15)
+        crop = image[y1 : y1 + round(dial_height * 0.35), crop_x1:crop_x2]
+        if crop.size == 0:
+            continue
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        enhanced = cv2.createCLAHE(2.0, (8, 8)).apply(gray)
+        multiscale_candidates: list[tuple[CounterOCRCandidate, float]] = []
+        for scale in (1.0, 3.0):
+            enlarged = cv2.resize(
+                enhanced,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
+            multiscale_candidates.extend(
+                (candidate, scale)
+                for candidate in extract_counter_candidates(reader.ocr(enlarged), None)
+            )
+        if not multiscale_candidates:
+            continue
+        three_digit = [
+            (candidate, scale)
+            for candidate, scale in multiscale_candidates
+            if len(candidate.normalized_display) == 3
+        ]
+        pool = three_digit or multiscale_candidates
+        crop_height, crop_width = enhanced.shape[:2]
+        counter, selected_scale = min(
+            pool,
+            key=lambda item: (
+                item[0].center[1] / item[1] / crop_height,
+                abs(item[0].center[0] / item[1] - crop_width / 2.0) / crop_width,
+                -item[0].confidence,
+            ),
+        )
+        selected.append(
+            replace(
+                counter,
+                center=(
+                    crop_x1 + counter.center[0] / selected_scale,
+                    y1 + counter.center[1] / selected_scale,
+                ),
+            )
+        )
+    return tuple(selected)
 
 
 def _box_luma(image: np.ndarray, box: np.ndarray) -> float:

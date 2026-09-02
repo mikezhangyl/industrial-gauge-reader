@@ -1,8 +1,10 @@
 import unittest
 
+import cv2
 import numpy as np
 
 from src.instrument_image import (
+    detect_colored_component_pointer,
     select_consensus_discrete_label,
     select_meter_hub,
     select_meter_pointer_line,
@@ -11,6 +13,19 @@ from src.rapidocr_reader import RAPIDOCR_PARAMS
 
 
 class TypeSpecificPointerTests(unittest.TestCase):
+    def test_colored_component_pointer_prefers_the_long_end(self):
+        image = np.full((300, 300, 3), 210, dtype=np.uint8)
+        cv2.line(image, (150, 160), (150, 45), (35, 35, 145), 7)
+        cv2.line(image, (150, 160), (185, 195), (35, 35, 180), 5)
+        cv2.circle(image, (150, 160), 14, (35, 35, 160), -1)
+
+        center, tip, angle, confidence = detect_colored_component_pointer(image)
+
+        self.assertAlmostEqual(center[0], 150, delta=12)
+        self.assertLess(tip[1], center[1])
+        self.assertTrue(angle >= 345 or angle <= 15)
+        self.assertGreaterEqual(confidence, 0.45)
+
     def test_specialized_ocr_uses_bounded_onnx_thread_pools(self):
         self.assertEqual(
             RAPIDOCR_PARAMS["EngineConfig.onnxruntime.inter_op_num_threads"], 1

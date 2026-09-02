@@ -13,6 +13,10 @@
       "KEQI",
       "OIL LEVEL"
     ],
+    "recognition_signatures": [
+      ["KEOI", "MAX", "MIN"],
+      ["油位计", "MAX", "MIN"]
+    ],
     "knowledge_status": "confirmed",
     "summary_zh": "通过浮球、传动机构和磁耦合驱动指针，显示变压器储油柜的相对油位，并可在高低限位置输出报警信号。",
     "readout_channels": [

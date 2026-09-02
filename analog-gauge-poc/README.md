@@ -85,15 +85,15 @@ python -m src.instrument_metadata "上海电瓷厂 JS-9 放电计数器"
 
 用户明确提供的人工确认值与类型知识分开保存在本地 `observations/`。该目录默认不进入 Git；只有空目录占位文件会被跟踪，避免将用户现场读数发布到公开仓库。新图片自动报告不要求 observation。
 
-对一批新图片生成多实例、多通道自动识别报告：
+推荐使用一个图片目录生成多实例、多通道自动识别报告：
 
 ```bash
-python batch_instrument_report.py image-1.jpg image-2.jpg image-3.jpg \
-  --device cpu \
-  --output output/user-instrument-batch.json
+python batch_instrument_report.py input/iter2
 ```
 
-输出 `output/user-instrument-batch.json` 和同名 HTML。HTML 按图片展示内嵌原图、程序识别结果、状态、方法、原始显示和说明，不依赖原始临时图片路径，也不展示置信度、人工答案或比对结论。JSON 保留包括原始置信度在内的完整自动数据；本地存在同 SHA-256 observation 时，还可保留人工确认和比较字段用于审计。
+目录名自动成为输出批次名；上述命令生成 `output/iter2/instrument-report.json` 和同名 HTML，并在终端打印两者的绝对路径。输入目录只能放原始、未画框和未写入读数的现场照片；程序检测到本项目生成的 `Pointer angle / Sweep position / Reading` 可视化覆盖层时，会生成明确失败记录并返回退出码 `2`，而不是继续给出伪读数。程序按 EXIF 方向和最长边 1920 像素标准化图片，不修改输入文件。HTML 使用统一大小的清晰预览，按检测区域裁剪并用绿色框标出仪表，不依赖原始路径，也不展示置信度、人工答案或比对结论。JSON 保留原图/分析图哈希和尺寸、检测框、运行环境、模型哈希及完整自动结果，便于跨机器核对。
+
+显式图片列表和 `--output` 仍可使用；完整命令、输出约定与跨机器复现检查统一以 [`docs/user-instrument-batch-runbook.md`](docs/user-instrument-batch-runbook.md) 为准。
 
 新增现场图片、维护 metadata、核对自动结果、保持固定 HTML 格式和查找输出文件的完整步骤，统一以 [`docs/user-instrument-batch-runbook.md`](docs/user-instrument-batch-runbook.md) 为准。
 

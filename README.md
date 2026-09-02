@@ -16,6 +16,8 @@
 
 使用说明见 [`analog-gauge-poc/README.md`](analog-gauge-poc/README.md)。
 
+新批次推荐把图片放入 `analog-gauge-poc/input/<batch-name>/`，然后在 `analog-gauge-poc` 下运行 `python batch_instrument_report.py input/<batch-name>`。程序会标准化输入并生成 `output/<batch-name>/instrument-report.html` 与同名 JSON，终端同时打印绝对路径。
+
 处理用户确认的现场仪表图片或生成固定格式图文报告时，AI Agent 必须遵循 [`analog-gauge-poc/docs/user-instrument-batch-runbook.md`](analog-gauge-poc/docs/user-instrument-batch-runbook.md)。
 
 ### `camera-clock-poc`
