@@ -202,11 +202,14 @@ def evaluate_image(
     for key in keys:
         automated = automated_by_key.get(key)
         confirmed = confirmed_by_key.get(key)
-        channel = (
-            metadata_catalog.get(type_id).channel(key[1])
-            if type_id is not None
-            else None
-        )
+        try:
+            channel = (
+                metadata_catalog.get(type_id).channel(key[1])
+                if type_id is not None
+                else None
+            )
+        except KeyError:
+            channel = None
         comparison = compare_channel(automated, confirmed, channel)
         channel_records.append(
             {
@@ -584,8 +587,10 @@ def render_html(
             if len(source_dimensions) == 2 and len(analysis_dimensions) == 2
             else ""
         )
-        instrument_type = record.get("instrument_type_id") or "未识别"
         failure_reason = record.get("analysis_failure_reason")
+        instrument_type = record.get("instrument_type_id") or (
+            "未识别" if failure_reason else "通用指针仪表（metadata 未匹配）"
+        )
         failure_markup = (
             f'<p class="failure-note">图片级失败：{html.escape(str(failure_reason))}</p>'
             if failure_reason
@@ -641,7 +646,7 @@ th{{background:#eef3ef}} .status{{display:inline-block;padding:2px 7px;border-ra
 </style></head><body><main><h1>仪表自动识别报告</h1>
 <p class="note">每张图片均经过 EXIF 方向校正和最长边 {NORMALIZED_MAX_EDGE}px 归一化；绿色框与读数来自本次程序运行。</p>
 <div class="summary"><div>图片 {summary["images"]}</div>
-<div>识别到仪表类型 {summary["instrument_types_recognized"]}/{summary["images"]}</div>
+<div>匹配到类型 metadata {summary["instrument_types_recognized"]}/{summary["images"]}</div>
 <div>程序识别通道 {summary["channels"]}</div>
 <div class="primary">识别成功 {summary["recognized"]}</div>
 <div>候选结果 {summary["ambiguous"]}</div>
