@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "dual_scale_rectangular_panel_meter",
+    "canonical_name_zh": "矩形双刻度面板表",
+    "aliases_zh": ["电压电流双刻度面板表"],
+    "model_markings": [],
+    "recognition_signatures": [["0.2", "0.4", "0.6", "METER"]],
+    "knowledge_status": "provisional",
+    "summary_zh": "表盘同时印有 0–15 和 0–0.6 两套刻度；仅凭照片不能确定当前接线采用哪套量程。",
+    "readout_channels": [
+      {
+        "channel_id": "active_scale_value",
+        "name_zh": "当前量程读数候选",
+        "display_type": "analog_pointer",
+        "quantity_kind": "voltage_or_current",
+        "unit": "V_or_A",
+        "value_format": "decimal",
+        "semantics_zh": "依次给出 0–15 电压刻度与 0–0.6 电流刻度的候选值。",
+        "scales": [
+          {"minimum": 0, "maximum": 15, "minor_division": 1},
+          {"minimum": 0, "maximum": 0.6, "minor_division": 0.04}
+        ],
+        "dial_arc": {
+          "start_angle_degrees": 315,
+          "end_angle_degrees": 45,
+          "direction": "clockwise",
+          "endpoint_snap_degrees": 3,
+          "quantize_to_minor_division": true
+        }
+      }
+    ],
+    "interpretation_rules_zh": [
+      "第一个候选对应 0–15 刻度，第二个候选对应 0–0.6 刻度。",
+      "未获得接线或量程选择信息时，不猜测哪一个候选是当前物理量。",
+      "宽表窗的轴心位于下方黑色外壳内，候选线的延长线必须穿过该轴心。"
+    ],
+    "sources": [
+      {
+        "source_type": "image_observation",
+        "title": "iter3 双联 V/A 双刻度面板表图片",
+        "reference": "sha256:6bc9509308d7b33859f128e02ed90bcfdb235c0ea198bd958b36135cdeaf1ea4"
+      }
+    ]
+  }
+}

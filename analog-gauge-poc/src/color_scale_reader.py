@@ -155,7 +155,12 @@ def _color_runs(rectified: np.ndarray) -> tuple[list[AngularRun], list[AngularRu
         np.uint8
     )
 
-    def runs(mask: np.ndarray) -> list[AngularRun]:
+    def runs(
+        mask: np.ndarray,
+        radial_start: float,
+        radial_end: float,
+        active_threshold: float,
+    ) -> list[AngularRun]:
         polar = cv2.warpPolar(
             mask,
             (300, POLAR_ANGLE_SAMPLES),
@@ -163,12 +168,39 @@ def _color_runs(rectified: np.ndarray) -> tuple[list[AngularRun], list[AngularRu
             DIAL_RADIUS,
             cv2.WARP_POLAR_LINEAR,
         )
-        annulus = polar[:, int(300 * 0.72) : int(300 * 0.98)]
+        annulus = polar[:, int(300 * radial_start) : int(300 * radial_end)]
         scores = np.mean(annulus > 0, axis=1)
-        active = _fill_short_gaps(scores > 0.30, maximum_gap=4)
+        active = _fill_short_gaps(scores > active_threshold, maximum_gap=4)
         return _circular_runs(active, scores)
 
-    return runs(red), runs(green)
+    candidates: list[
+        tuple[int, float, int, list[AngularRun], list[AngularRun]]
+    ] = []
+    for index, (radial_start, radial_end, active_threshold) in enumerate(
+        ((0.72, 0.98, 0.30), (0.50, 0.82, 0.22))
+    ):
+        red_runs = runs(red, radial_start, radial_end, active_threshold)
+        green_runs = runs(green, radial_start, radial_end, active_threshold)
+        if not red_runs or not green_runs:
+            continue
+        try:
+            selected_red, green_chain, _zero, _direction = _positive_chain(
+                red_runs, green_runs
+            )
+        except ValueError:
+            continue
+        mean_confidence = float(
+            np.mean([selected_red.confidence, *[run.confidence for run in green_chain]])
+        )
+        candidates.append(
+            (len(green_chain), mean_confidence, -index, red_runs, green_runs)
+        )
+    if not candidates:
+        return [], []
+    _count, _confidence, _preference, red_runs, green_runs = max(
+        candidates, key=lambda item: item[:3]
+    )
+    return red_runs, green_runs
 
 
 def _positive_chain(

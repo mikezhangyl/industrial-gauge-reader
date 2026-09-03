@@ -7,9 +7,11 @@ import numpy as np
 from src.ethz_vision_reader import NumericLabel
 from src.rapidocr_reader import (
     RobustScaleFit,
+    consolidate_duplicate_labels,
     pointer_from_rectified_mask,
     reading_from_fit,
     robust_scale_fit,
+    sector_crops,
 )
 
 
@@ -65,6 +67,55 @@ class RapidOCRScaleFitTests(unittest.TestCase):
         pointer_phase = math.radians(8.0)
         direction = np.asarray((math.cos(pointer_phase), math.sin(pointer_phase)))
         self.assertAlmostEqual(reading_from_fit(direction, fit), 68 / 27, places=6)
+
+    def test_same_ocr_value_at_distant_phases_remains_as_separate_candidates(self):
+        ellipse = ((320.0, 320.0), (600.0, 600.0), 0.0)
+
+        consolidated = consolidate_duplicate_labels(
+            [
+                self.label(1, 45, 0.53),
+                self.label(1, 48, 0.51),
+                self.label(1, 255, 0.59),
+            ],
+            ellipse,
+        )
+
+        self.assertEqual(len(consolidated), 2)
+
+    def test_scale_fit_can_reject_a_distant_duplicate_ocr_value(self):
+        ellipse = ((320.0, 320.0), (600.0, 600.0), 0.0)
+        labels = [
+            self.label(231617, 15, 0.78),
+            self.label(0, 30, 0.56),
+            self.label(1, 45, 0.53),
+            self.label(2, 60, 0.98),
+            self.label(1, 255, 0.59),
+            self.label(8, 270, 0.99),
+            self.label(10, 315, 0.94),
+            self.label(7, 330, 0.84),
+        ]
+
+        _, inliers, rejected = robust_scale_fit(labels, ellipse)
+
+        self.assertEqual([label.value for label in inliers], [0, 1, 2, 8, 10])
+        self.assertIn(231617, {label.value for label in rejected})
+
+    def test_three_printed_scale_numbers_are_sufficient_for_a_fit(self):
+        ellipse = ((320.0, 320.0), (600.0, 600.0), 0.0)
+
+        fit, inliers, _ = robust_scale_fit(
+            [self.label(0, 45), self.label(50, 135), self.label(100, 225)],
+            ellipse,
+        )
+
+        self.assertEqual(len(inliers), 3)
+        self.assertAlmostEqual(fit.rmse, 0.0, places=6)
+
+    def test_numeric_sector_ocr_samples_two_radial_bands(self):
+        crops, phases = sector_crops(np.zeros((640, 640, 3), dtype=np.uint8))
+
+        self.assertEqual(len(crops), 48)
+        self.assertEqual(phases.count(75.0), 2)
 
     def test_wide_pointer_uses_its_tip_instead_of_triangle_area(self):
         mask = np.zeros((640, 640), dtype=np.uint8)

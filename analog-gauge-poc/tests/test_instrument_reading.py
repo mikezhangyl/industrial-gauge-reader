@@ -55,7 +55,10 @@ class InstrumentReadingInterpreterTests(unittest.TestCase):
         self.assertFalse(result.level3)
 
     def test_decimal_pointer_reading_is_preserved_with_metadata_unit(self):
-        result = self.interpreter.interpret(raw_result(3.4), "KEQI YZF3 OIL LEVEL")
+        result = self.interpreter.interpret(
+            replace(raw_result(3.4), angle_degrees=None),
+            "KEQI YZF3 OIL LEVEL",
+        )
 
         self.assertEqual(result.reading, 3.4)
         self.assertEqual(result.raw_reading, 3.4)
@@ -66,6 +69,25 @@ class InstrumentReadingInterpreterTests(unittest.TestCase):
         )
         self.assertEqual(result.interpretation_method, "metadata:preserve_raw_reading")
 
+    def test_oil_level_uses_confirmed_zero_and_ten_arc_endpoints(self):
+        visual = replace(raw_result(3.6), angle_degrees=216.0)
+
+        result = self.interpreter.interpret(visual, "KEOI OIL LEVEL MAX MIN")
+
+        self.assertAlmostEqual(result.reading, 3.37, delta=0.03)
+        self.assertEqual(result.interpretation_method, "metadata:dial_arc_scale")
+
+    def test_round_oil_level_correct_ellipse_maps_pointer_to_about_2_6(self):
+        visual = replace(raw_result(2.7), angle_degrees=201.52776105436746)
+
+        result = self.interpreter.interpret(
+            visual,
+            "油位 8 9 10 5 4 3 2 1 0",
+        )
+
+        self.assertAlmostEqual(result.reading, 2.60, delta=0.02)
+        self.assertEqual(result.interpretation_method, "metadata:dial_arc_scale")
+
     def test_known_single_scale_arc_recovers_zero_without_numeric_ocr(self):
         visual = replace(raw_result(0.2), reading=None, angle_degrees=311.0)
 
@@ -75,6 +97,53 @@ class InstrumentReadingInterpreterTests(unittest.TestCase):
         self.assertEqual(result.unit, "mA")
         self.assertEqual(result.instrument_type_id, "surge_arrester_monitor")
         self.assertEqual(result.interpretation_method, "metadata:dial_arc_scale")
+
+    def test_arrester_zero_endpoint_accepts_perspective_affected_pointer_angle(self):
+        visual = replace(raw_result(0.2), reading=None, angle_degrees=301.5)
+
+        result = self.interpreter.interpret(
+            visual,
+            "JCQ-10/600Z mA 005 动作电流",
+        )
+
+        self.assertEqual(result.reading, 0.0)
+        self.assertEqual(result.interpretation_method, "metadata:dial_arc_scale")
+
+    def test_hidden_pivot_tick_fraction_overrides_perspective_affected_angle(self):
+        visual = replace(
+            raw_result(0.2),
+            reading=None,
+            angle_degrees=322.0,
+            sweep_fraction=0.0,
+            center_method="type-specific:hidden-pivot+tick-scale+extended-line",
+        )
+
+        result = self.interpreter.interpret(
+            visual,
+            "JCQ-10/600Z mA 005 动作电流",
+        )
+
+        self.assertEqual(result.reading, 0.0)
+        self.assertEqual(result.interpretation_method, "metadata:visual_sweep_scale")
+
+    def test_hidden_pivot_visual_fraction_uses_metadata_endpoint_snap(self):
+        visual = replace(
+            raw_result(0.2),
+            reading=None,
+            angle_degrees=309.2,
+            sweep_fraction=0.05042564285794058,
+            center_method=(
+                "type-specific:perspective-aware-hidden-pivot+tick-scale+pointer-tip"
+            ),
+        )
+
+        result = self.interpreter.interpret(
+            visual,
+            "JCQ-10/600Z mA 005 动作电流",
+        )
+
+        self.assertEqual(result.reading, 0.0)
+        self.assertEqual(result.interpretation_method, "metadata:visual_sweep_scale")
 
     def test_dual_scale_arc_returns_candidates_instead_of_guessing_scale(self):
         visual = replace(raw_result(1.0), reading=None, angle_degrees=274.0)
@@ -88,6 +157,13 @@ class InstrumentReadingInterpreterTests(unittest.TestCase):
             result.interpretation_method,
             "metadata:ambiguous_scale_candidates",
         )
+
+    def test_dual_scale_first_tick_is_stable_under_original_image_angle(self):
+        visual = replace(raw_result(1.0), reading=None, angle_degrees=278.2)
+
+        result = self.interpreter.interpret(visual, "D96-V 同期电压表")
+
+        self.assertEqual(result.reading_candidates, (1.0, 2.0))
 
     def test_unmatched_visible_text_leaves_raw_result_unchanged(self):
         original = raw_result(2.5)

@@ -46,6 +46,16 @@ class InstrumentReadingInterpreter:
             instrument_type_id=metadata.type_id,
             readout_channel_id=channel.channel_id,
         )
+        if (
+            result.sweep_fraction is not None
+            and result.center_method is not None
+            and "hidden-pivot+tick-scale" in result.center_method
+        ):
+            return _interpret_visual_sweep_fraction(interpreted, channel)
+        if channel.dial_arc is not None and result.angle_degrees is not None:
+            angle_interpreted = _interpret_dial_angle(interpreted, channel)
+            if angle_interpreted.interpretation_method != "metadata:dial_arc_rejected":
+                return angle_interpreted
         raw_reading = result.reading
         if raw_reading is None:
             return _interpret_dial_angle(interpreted, channel)
@@ -167,6 +177,52 @@ def _interpret_dial_angle(result: GaugeResult, channel: ReadoutChannel) -> Gauge
         reading=None,
         reading_candidates=candidates,
         interpretation_method=(f"metadata:ambiguous_scale_candidates{method_suffix}"),
+        failure_reason="The active scale cannot be selected from the image alone",
+    )
+
+
+def _interpret_visual_sweep_fraction(
+    result: GaugeResult,
+    channel: ReadoutChannel,
+) -> GaugeResult:
+    fraction = result.sweep_fraction
+    arc = channel.dial_arc
+    if fraction is None or arc is None or not channel.scales:
+        return result
+    if not 0.0 <= fraction <= 1.0:
+        return replace(
+            result,
+            reading=None,
+            interpretation_method="metadata:visual_sweep_rejected",
+            failure_reason="Visual scale fraction falls outside the dial sweep",
+        )
+    if arc.direction == "clockwise":
+        total_sweep = (arc.end_angle_degrees - arc.start_angle_degrees) % 360.0
+    else:
+        total_sweep = (arc.start_angle_degrees - arc.end_angle_degrees) % 360.0
+    if total_sweep > 0.0:
+        endpoint_fraction = min(0.5, arc.endpoint_snap_degrees / total_sweep)
+        if fraction <= endpoint_fraction:
+            fraction = 0.0
+        elif 1.0 - fraction <= endpoint_fraction:
+            fraction = 1.0
+    candidates = tuple(
+        _scale_value(scale, fraction, arc.quantize_to_minor_division)
+        for scale in channel.scales
+    )
+    if len(candidates) == 1:
+        return replace(
+            result,
+            reading=candidates[0],
+            reading_candidates=(),
+            interpretation_method="metadata:visual_sweep_scale",
+            failure_reason=None,
+        )
+    return replace(
+        result,
+        reading=None,
+        reading_candidates=candidates,
+        interpretation_method="metadata:visual_sweep_candidates",
         failure_reason="The active scale cannot be selected from the image alone",
     )
 

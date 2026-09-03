@@ -27,6 +27,8 @@ class NormalizedBatchImage:
     source_size: tuple[int, int]
     oriented_size: tuple[int, int]
     normalized_size: tuple[int, int]
+    detail_path: Path | None = None
+    detail_size: tuple[int, int] | None = None
 
 
 def discover_input_images(inputs: list[Path]) -> tuple[list[Path], Path | None]:
@@ -86,6 +88,7 @@ def normalize_batch_images(
     destination_directory: Path,
     *,
     max_edge: int = NORMALIZED_MAX_EDGE,
+    preserve_full_resolution_detail: bool = False,
 ) -> list[NormalizedBatchImage]:
     """Apply EXIF orientation and a deterministic maximum edge to every image."""
     if max_edge <= 0:
@@ -100,10 +103,16 @@ def normalize_batch_images(
         except OSError as error:
             raise ValueError(f"Cannot decode image: {source_path}") from error
         oriented_size = oriented.size
-        if max(oriented.size) > max_edge:
-            oriented.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         analysis_path = destination_directory / f"{index + 1:04d}.png"
-        oriented.save(analysis_path, format="PNG", compress_level=6)
+        if preserve_full_resolution_detail and max(oriented.size) > max_edge:
+            detail_path = destination_directory / f"{index + 1:04d}-detail.png"
+            oriented.save(detail_path, format="PNG", compress_level=6)
+        else:
+            detail_path = analysis_path
+        analysis = oriented.copy()
+        if max(analysis.size) > max_edge:
+            analysis.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        analysis.save(analysis_path, format="PNG", compress_level=6)
         normalized.append(
             NormalizedBatchImage(
                 source_path=source_path,
@@ -111,7 +120,11 @@ def normalize_batch_images(
                 source_sha256=_sha256(source_path),
                 source_size=source_size,
                 oriented_size=oriented_size,
-                normalized_size=oriented.size,
+                normalized_size=analysis.size,
+                detail_path=detail_path,
+                detail_size=(
+                    oriented_size if preserve_full_resolution_detail else analysis.size
+                ),
             )
         )
     return normalized
@@ -190,6 +203,28 @@ def annotated_preview_data_uri(
     canvas.paste(fitted, offset)
     buffer = io.BytesIO()
     canvas.save(buffer, format="JPEG", quality=90, optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def processing_stage_thumbnail_data_uri(
+    image_path: Path,
+    *,
+    preview_size: tuple[int, int] = (480, 320),
+) -> str:
+    """Embed a contain-only thumbnail while leaving the stage sidecar untouched."""
+
+    with Image.open(image_path) as source:
+        image = source.convert("RGB")
+    fitted = ImageOps.contain(image, preview_size, Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", preview_size, "#eef1ee")
+    offset = (
+        (preview_size[0] - fitted.width) // 2,
+        (preview_size[1] - fitted.height) // 2,
+    )
+    canvas.paste(fitted, offset)
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="JPEG", quality=88, optimize=True)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
 

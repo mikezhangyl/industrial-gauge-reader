@@ -11,10 +11,11 @@
     "model_markings": [
       "YZF3",
       "KEQI",
+      "KEOI",
       "OIL LEVEL"
     ],
     "recognition_signatures": [
-      ["KEOI", "MAX", "MIN"],
+      ["KEOI", "MAX"],
       ["油位计", "MAX", "MIN"]
     ],
     "knowledge_status": "confirmed",
@@ -34,7 +35,14 @@
             "maximum": 10,
             "minor_division": 1
           }
-        ]
+        ],
+        "dial_arc": {
+          "start_angle_degrees": 120,
+          "end_angle_degrees": 45,
+          "direction": "clockwise",
+          "endpoint_snap_degrees": 5,
+          "quantize_to_minor_division": false
+        }
       }
     ],
     "interpretation_rules_zh": [

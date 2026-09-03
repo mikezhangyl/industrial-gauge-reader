@@ -126,24 +126,35 @@ class InstrumentMetadataCatalog:
         query = _normalize(visible_text)
         if not query:
             return ()
-        matches = []
+        matches: list[tuple[int, InstrumentTypeMetadata]] = []
         for item in self.instrument_types:
-            terms = (
-                item.canonical_name_zh,
-                *item.aliases_zh,
-                *item.model_markings,
-            )
-            normalized_terms = tuple(_normalize(term) for term in terms)
-            term_match = any(
-                term in query or query in term for term in normalized_terms
-            )
-            signature_match = any(
-                all(_normalize(term) in query for term in signature)
-                for signature in item.recognition_signatures
-            )
-            if term_match or signature_match:
-                matches.append(item)
-        return tuple(matches)
+            score = _metadata_match_score(item, query)
+            if score is not None:
+                matches.append((score, item))
+        if not matches:
+            return ()
+        best_score = max(score for score, _item in matches)
+        return tuple(item for score, item in matches if score == best_score)
+
+
+def _metadata_match_score(
+    item: InstrumentTypeMetadata, normalized_query: str
+) -> int | None:
+    """Prefer an exact model marking over a broad instrument-family phrase."""
+    scores: list[int] = []
+    for marking in item.model_markings:
+        term = _normalize(marking)
+        if term and (term in normalized_query or normalized_query in term):
+            scores.append(10_000 + len(term))
+    for signature in item.recognition_signatures:
+        terms = tuple(_normalize(term) for term in signature)
+        if terms and all(term in normalized_query for term in terms):
+            scores.append(1_000 * len(terms) + sum(len(term) for term in terms))
+    for phrase in (item.canonical_name_zh, *item.aliases_zh):
+        term = _normalize(phrase)
+        if term and (term in normalized_query or normalized_query in term):
+            scores.append(100 + len(term))
+    return max(scores) if scores else None
 
 
 def _load_metadata_file(path: Path) -> tuple[InstrumentTypeMetadata, ...]:

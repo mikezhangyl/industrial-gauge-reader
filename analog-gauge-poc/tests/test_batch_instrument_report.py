@@ -314,6 +314,59 @@ class BatchInstrumentReportTests(unittest.TestCase):
         self.assertIn("通用指针仪表（metadata 未匹配）", report)
         self.assertNotIn('<p class="failure-note">', report)
 
+    def test_html_stage_gallery_embeds_thumbnail_and_links_original_png(self):
+        payload = {
+            "automated_summary": {
+                "images": 1,
+                "instrument_types_recognized": 0,
+                "channels": 0,
+                "recognized": 0,
+                "ambiguous": 0,
+                "not_recognized": 0,
+                "analysis_failures": 1,
+            },
+            "records": [
+                {
+                    "image": "meter.jpg",
+                    "instrument_type_id": None,
+                    "analysis_failure_reason": "not read",
+                    "detections": [],
+                    "channels": [],
+                    "processing_stages": [
+                        {
+                            "group": "dial-1",
+                            "stage_id": "model-input",
+                            "title_zh": "指针模型实际输入图",
+                            "path": "processing-stages/run/image/dial-1/01-model-input.png",
+                            "dimensions": [448, 448],
+                            "aspect_ratio": 1.0,
+                            "operation": "resize_600x400_to_448x448",
+                            "source_stage": "segmentation-canvas",
+                            "preserves_aspect_ratio": False,
+                            "note_zh": "非正方形画布被缩放为正方形。",
+                        }
+                    ],
+                }
+            ],
+        }
+        with TemporaryDirectory() as temp_dir:
+            report_directory = Path(temp_dir)
+            stage_path = (
+                report_directory
+                / "processing-stages/run/image/dial-1/01-model-input.png"
+            )
+            stage_path.parent.mkdir(parents=True)
+            Image.new("RGB", (448, 448), "white").save(stage_path)
+
+            report = render_html(payload, report_directory=report_directory)
+
+        self.assertIn("处理阶段审阅（1 张原尺寸 PNG）", report)
+        self.assertIn("data:image/jpeg;base64,", report)
+        self.assertIn("448×448 · 宽高比 1.000000", report)
+        self.assertIn("改变宽高比", report)
+        self.assertIn("打开原尺寸 PNG", report)
+        self.assertIn("processing-stages/run/image/dial-1/01-model-input.png", report)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -59,6 +59,8 @@ Run the current automated pipeline on the original image before changing anythin
 
 Use the earliest failing boundary to choose the change. Do not infer the cause only from the final HTML status.
 
+For a circular housing, ring, ellipse fit, or pose rectification, read and apply `analog-gauge-poc/docs/dial-geometry-validation.md`. Treat geometry quality and the final reading as separate acceptance boundaries.
+
 Type metadata is optional enrichment, never a visual-analysis gate. When no unique type matches, the batch pipeline must continue with the generic pointer reader, retain any visually supported reading, and mark unknown type, unit, or business semantics explicitly. Record an image-level failure only when the visual pipeline itself cannot analyze the instrument.
 
 ## 3. Choose the smallest reusable extension
@@ -105,6 +107,7 @@ Add a targeted regression test at the boundary being extended, then run the orig
 - HTML shows only automated results and omits confidence, human answers, and human/automatic comparison;
 - JSON retains complete automated diagnostics;
 - previously supported instrument tests still pass;
+- ellipse-related changes pass the geometry-quality gates and intermediate-image review in `analog-gauge-poc/docs/dial-geometry-validation.md`; a stable final value alone is insufficient;
 - code checks, type checks, and `git diff --check` pass.
 
 Use the real model-backed command for final validation. A unit test or mocked run does not prove the image works.
