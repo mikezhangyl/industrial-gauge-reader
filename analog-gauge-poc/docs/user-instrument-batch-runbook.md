@@ -172,9 +172,13 @@ git diff --check
 
 程序会分别调用固定批次入口，并生成：
 
-- `output/640-adaptation/profile-comparison.json`
-- `output/640-adaptation/profile-comparison.html`
-- `output/640-adaptation/<profile>/<batch>/instrument-report.{json,html}`
+- `output/640-adaptation/<timestamp>/profile-comparison.json`
+- `output/640-adaptation/<timestamp>/profile-comparison.html`
+- `output/640-adaptation/<timestamp>/<profile>/<batch>/instrument-report.{json,html}`
+
+`--output-dir` 是运行历史根目录。每次执行必须创建新的微秒级时间戳子目录，
+不复用旧运行目录，也不依赖不同操作系统或文件系统的修改时间判断产物是否
+属于本次运行。程序会在终端打印本次实际 JSON 和 HTML 的绝对路径。
 
 比较报告只说明两个程序 profile 的输出是否变化，不把任一方当成人工真值。只有有 observation 的通道才能判断正确率变化；其余变化必须标为漂移、覆盖增减或状态变化，不能宣称改善。当前默认是 `448-highres-pad`；任何后续 profile 仍不得在未通过全部保留批次回归前替换默认值。
 

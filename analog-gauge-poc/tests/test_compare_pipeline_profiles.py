@@ -1,10 +1,13 @@
 import json
 import tempfile
-import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
-from compare_pipeline_profiles import load_completed_report
+from compare_pipeline_profiles import (
+    create_timestamped_run_directory,
+    load_completed_report,
+)
 
 
 class ComparePipelineProfilesTests(unittest.TestCase):
@@ -13,7 +16,6 @@ class ComparePipelineProfilesTests(unittest.TestCase):
             root = Path(temp_dir)
             json_path = root / "instrument-report.json"
             html_path = root / "instrument-report.html"
-            started_ns = time.time_ns()
             json_path.write_text(
                 json.dumps(
                     {
@@ -33,46 +35,26 @@ class ComparePipelineProfilesTests(unittest.TestCase):
                 html_path,
                 expected_profile="640",
                 expected_images=["meter.jpg"],
-                started_ns=started_ns,
             )
 
             self.assertEqual(payload["pipeline_profile"]["name"], "640")
 
-    def test_accepts_fresh_report_with_small_filesystem_mtime_skew(self):
+    def test_creates_an_isolated_timestamped_directory_per_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            json_path = root / "instrument-report.json"
-            html_path = root / "instrument-report.html"
-            json_path.write_text(
-                json.dumps(
-                    {
-                        "pipeline_profile": {"name": "640"},
-                        "input_contract": {"image_order": ["meter.jpg"]},
-                        "records": [{"image": "meter.jpg"}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            html_path.write_text(
-                "<!doctype html><html><title>report</title></html>", encoding="utf-8"
-            )
+            instant = datetime(2026, 9, 4, 12, 34, 56, 123456, tzinfo=timezone.utc)
 
-            payload = load_completed_report(
-                json_path,
-                html_path,
-                expected_profile="640",
-                expected_images=["meter.jpg"],
-                started_ns=max(
-                    json_path.stat().st_mtime_ns,
-                    html_path.stat().st_mtime_ns,
-                )
-                + 500_000,
-                freshness_mtime_skew_ns=1_000_000,
+            run_directory = create_timestamped_run_directory(root, now=instant)
+
+            self.assertEqual(
+                run_directory.name,
+                "20260904T123456123456+0000",
             )
+            self.assertTrue(run_directory.is_dir())
+            with self.assertRaises(FileExistsError):
+                create_timestamped_run_directory(root, now=instant)
 
-            self.assertEqual(payload["pipeline_profile"]["name"], "640")
-
-    def test_rejects_a_stale_or_wrong_profile_report(self):
+    def test_rejects_a_wrong_profile_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             json_path = root / "instrument-report.json"
@@ -91,15 +73,26 @@ class ComparePipelineProfilesTests(unittest.TestCase):
                 "<!doctype html><html><title>report</title></html>", encoding="utf-8"
             )
 
-            with self.assertRaisesRegex(ValueError, "not freshly generated"):
+            with self.assertRaisesRegex(ValueError, "profile mismatch"):
                 load_completed_report(
                     json_path,
                     html_path,
                     expected_profile="640",
                     expected_images=["meter.jpg"],
-                    # Keep this well beyond the small filesystem-skew
-                    # tolerance used for freshly written artifacts.
-                    started_ns=time.time_ns() + 10_000_000,
+                )
+
+    def test_rejects_incomplete_report_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            json_path = root / "instrument-report.json"
+            json_path.write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "artifacts are incomplete"):
+                load_completed_report(
+                    json_path,
+                    root / "instrument-report.html",
+                    expected_profile="640",
+                    expected_images=["meter.jpg"],
                 )
 
 
