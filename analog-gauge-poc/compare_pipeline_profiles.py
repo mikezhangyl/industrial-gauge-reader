@@ -11,8 +11,8 @@ import re
 import signal
 import subprocess
 import sys
-import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,11 +24,6 @@ from src.profile_comparison import compare_profile_payloads
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_PROFILE_NAMES = ("448", "640")
-# Some container/overlay filesystems report a freshly written file a few
-# hundred microseconds before the parent process's wall-clock sample.  Keep
-# this tolerance deliberately small; stale artifacts are removed before each
-# profile run below, so this only covers filesystem timestamp skew.
-FRESHNESS_MTIME_SKEW_NS = 1_000_000
 
 
 def main() -> int:
@@ -49,6 +44,10 @@ def main() -> int:
         "--output-dir",
         type=Path,
         default=PROJECT_ROOT / "output" / "pipeline-profile-comparison",
+        help=(
+            "Run-history root. Each invocation writes to a new timestamped "
+            "subdirectory."
+        ),
     )
     parser.add_argument(
         "--export-processing-stages",
@@ -60,7 +59,7 @@ def main() -> int:
     for path in input_directories:
         if not path.is_dir():
             parser.error(f"Input is not a directory: {path}")
-    output_dir = args.output_dir.resolve()
+    output_dir = create_timestamped_run_directory(args.output_dir.resolve())
     profile_names = tuple(args.profiles)
     batches = [
         _run_batch(
@@ -79,6 +78,8 @@ def main() -> int:
         for key, value in summary.items():
             aggregate[key] += int(value)
     payload = {
+        "run_id": output_dir.name,
+        "output_directory": str(output_dir),
         "profiles": list(profile_names),
         "inputs": [str(path) for path in input_directories],
         "summary": dict(aggregate),
@@ -117,11 +118,6 @@ def _run_batch(
     for profile_name in profile_names:
         profile_dir = output_dir / profile_name / batch_key
         json_path = profile_dir / "instrument-report.json"
-        # A prior report must never be mistaken for a successful current run.
-        # Removing generated artifacts also lets the freshness check tolerate
-        # the small mtime skew seen on remote overlay filesystems safely.
-        json_path.unlink(missing_ok=True)
-        json_path.with_suffix(".html").unlink(missing_ok=True)
         command = [
             sys.executable,
             str(PROJECT_ROOT / "batch_instrument_report.py"),
@@ -135,7 +131,6 @@ def _run_batch(
         ]
         if export_processing_stages:
             command.insert(-1, "--export-processing-stages")
-        started_ns = time.time_ns()
         completed = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
         if completed.returncode not in (0, -signal.SIGABRT):
             raise subprocess.CalledProcessError(completed.returncode, command)
@@ -144,8 +139,6 @@ def _run_batch(
             json_path.with_suffix(".html"),
             expected_profile=profile_name,
             expected_images=expected_images,
-            started_ns=started_ns,
-            freshness_mtime_skew_ns=FRESHNESS_MTIME_SKEW_NS,
         )
         if completed.returncode == -signal.SIGABRT:
             warning = {
@@ -188,17 +181,11 @@ def load_completed_report(
     *,
     expected_profile: str,
     expected_images: list[str],
-    started_ns: int,
-    freshness_mtime_skew_ns: int = FRESHNESS_MTIME_SKEW_NS,
 ) -> dict[str, Any]:
-    """Load only artifacts freshly and completely written by the current command."""
+    """Load report artifacts only after validating their content contract."""
 
     if not json_path.is_file() or not html_path.is_file():
         raise ValueError("Batch report artifacts are incomplete")
-    if min(json_path.stat().st_mtime_ns, html_path.stat().st_mtime_ns) < (
-        started_ns - freshness_mtime_skew_ns
-    ):
-        raise ValueError("Batch report artifacts were not freshly generated")
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     profile_name = (payload.get("pipeline_profile") or {}).get("name")
     if profile_name != expected_profile:
@@ -212,6 +199,17 @@ def load_completed_report(
     if "</html>" not in html_path.read_text(encoding="utf-8").casefold():
         raise ValueError("Batch HTML report is incomplete")
     return payload
+
+
+def create_timestamped_run_directory(
+    output_root: Path, *, now: datetime | None = None
+) -> Path:
+    """Create an isolated output directory for one comparison invocation."""
+
+    instant = now or datetime.now().astimezone()
+    run_directory = output_root / instant.strftime("%Y%m%dT%H%M%S%f%z")
+    run_directory.mkdir(parents=True, exist_ok=False)
+    return run_directory
 
 
 def _batch_key(index: int, name: str) -> str:
