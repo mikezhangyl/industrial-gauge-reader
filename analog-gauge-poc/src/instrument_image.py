@@ -133,6 +133,20 @@ class HiddenPivotEstimate:
     outer_ellipse_edge_support: float | None = None
 
 
+@dataclass(frozen=True)
+class CircularPointerPose:
+    """Pointer geometry transformed into a verified front-facing dial plane."""
+
+    outer_ellipse: Ellipse
+    edge_support: float
+    visible_arc_fraction: float
+    rectification_transform: np.ndarray
+    rectified_center: np.ndarray
+    rectified_tip: np.ndarray
+    angle_degrees: float
+    obliquity_degrees: float
+
+
 class MetadataAwareImageAnalyzer:
     """Return every metadata-declared channel without mixing in human answers."""
 
@@ -901,6 +915,36 @@ def measure_outer_meter_ellipse_quality(
         ellipse,
         edge_distance=edge_distance,
         image_shape=image.shape[:2],
+    )
+
+
+def normalize_circular_pointer_pose(
+    image: np.ndarray,
+    center: np.ndarray,
+    tip: np.ndarray,
+) -> CircularPointerPose:
+    """Rectify a circular dial and measure its pointer in the dial plane."""
+
+    ellipse = detect_outer_meter_ellipse(image)
+    edge_support, visible_arc_fraction = measure_outer_meter_ellipse_quality(
+        image,
+        ellipse,
+    )
+    _, transform = rectify_dial(image, ellipse)
+    rectified_center = _transform_affine_point(transform, center)
+    rectified_tip = _transform_affine_point(transform, tip)
+    minor, major = sorted(ellipse[1])
+    axis_ratio = float(np.clip(minor / max(major, 1.0), 0.0, 1.0))
+    obliquity_degrees = math.degrees(math.acos(axis_ratio))
+    return CircularPointerPose(
+        outer_ellipse=ellipse,
+        edge_support=edge_support,
+        visible_arc_fraction=visible_arc_fraction,
+        rectification_transform=transform,
+        rectified_center=rectified_center,
+        rectified_tip=rectified_tip,
+        angle_degrees=angle_from_points(rectified_center, rectified_tip),
+        obliquity_degrees=obliquity_degrees,
     )
 
 
@@ -1881,6 +1925,31 @@ def detect_colored_component_pointer(
     return center, tip, angle, confidence
 
 
+def _selected_pointer_bbox(
+    image: np.ndarray,
+    candidate: DialCandidate,
+    center: np.ndarray,
+    *,
+    include_outer_label_ring: bool,
+    outer_label_extent_factor: float,
+) -> tuple[int, int, int, int]:
+    """Return the exact crop shared by reading and audit-stage generation."""
+
+    x1, y1, x2, y2 = candidate.bbox
+    if not include_outer_label_ring:
+        return x1, y1, x2, y2
+    inner_size = max(x2 - x1, y2 - y1)
+    # Radius from the pointer hub, not a per-side padding. Different dial
+    # constructions place their readable labels at different radii.
+    outer_extent = inner_size * outer_label_extent_factor
+    return (
+        max(0, round(float(center[0]) - outer_extent)),
+        max(0, round(float(center[1]) - outer_extent)),
+        min(image.shape[1], round(float(center[0]) + outer_extent)),
+        min(image.shape[0], round(float(center[1]) + outer_extent)),
+    )
+
+
 def _write_selected_pointer_stages(
     writer: ProcessingStageWriter | None,
     image: np.ndarray,
@@ -1894,20 +1963,18 @@ def _write_selected_pointer_stages(
     include_outer_label_ring: bool = False,
     include_hidden_pivot_evidence: bool = False,
     outer_label_extent_factor: float = 0.68,
+    circular_pose: CircularPointerPose | None = None,
 ) -> None:
     if writer is None:
         return
-    x1, y1, x2, y2 = candidate.bbox
-    if include_outer_label_ring:
-        inner_size = max(x2 - x1, y2 - y1)
-        # Radius from the pointer hub, not a per-side padding.  Different dial
-        # constructions place their readable labels at different radii.
-        outer_extent = inner_size * outer_label_extent_factor
-        x1 = max(0, round(float(center[0]) - outer_extent))
-        y1 = max(0, round(float(center[1]) - outer_extent))
-        x2 = min(image.shape[1], round(float(center[0]) + outer_extent))
-        y2 = min(image.shape[0], round(float(center[1]) + outer_extent))
-    selected_bbox = (x1, y1, x2, y2)
+    selected_bbox = _selected_pointer_bbox(
+        image,
+        candidate,
+        center,
+        include_outer_label_ring=include_outer_label_ring,
+        outer_label_extent_factor=outer_label_extent_factor,
+    )
+    x1, y1, x2, y2 = selected_bbox
     crop = image[y1:y2, x1:x2]
     writer.write(
         group,
@@ -1933,6 +2000,71 @@ def _write_selected_pointer_stages(
         preserves_aspect_ratio=True,
         note_zh="保留完整仪表外圈和内部读数窗口，未拉伸。",
     )
+    if circular_pose is not None:
+        minor, major = sorted(circular_pose.outer_ellipse[1])
+        writer.write(
+            group,
+            "outer-ellipse-fit",
+            draw_ellipse(crop, circular_pose.outer_ellipse),
+            title_zh="物理外圈椭圆姿态基准",
+            operation="verified_outer_rim_edge_ellipse_fit",
+            source_stage="selected-crop",
+            preserves_aspect_ratio=True,
+            note_zh=(
+                "绿色椭圆必须贴合物理外圈，不能只追求框住表盘。"
+                f"边缘贴合率 {circular_pose.edge_support:.1%}，"
+                f"可见圆弧比例 {circular_pose.visible_arc_fraction:.1%}，"
+                f"短长轴比 {minor / max(major, 1.0):.3f}，"
+                f"估计斜拍角 {circular_pose.obliquity_degrees:.1f}°。"
+            ),
+        )
+        rectified, _ = rectify_dial(crop, circular_pose.outer_ellipse)
+        writer.write(
+            group,
+            "rectified-dial",
+            rectified,
+            title_zh="外圈校正后的正视表盘",
+            operation="outer_ellipse_affine_rectification",
+            source_stage="outer-ellipse-fit",
+            preserves_aspect_ratio=False,
+            note_zh="依据可靠物理外圈将椭圆恢复为圆；后续角度在此坐标系计算。",
+        )
+        rectified_overlay = rectified.copy()
+        rectified_center = tuple(
+            np.rint(circular_pose.rectified_center).astype(int)
+        )
+        rectified_tip = tuple(np.rint(circular_pose.rectified_tip).astype(int))
+        line_width = max(2, round(max(rectified.shape[:2]) / 180))
+        cv2.circle(
+            rectified_overlay,
+            rectified_center,
+            max(4, line_width * 2),
+            (40, 180, 40),
+            line_width,
+            cv2.LINE_AA,
+        )
+        cv2.arrowedLine(
+            rectified_overlay,
+            rectified_center,
+            rectified_tip,
+            (0, 0, 255),
+            line_width,
+            cv2.LINE_AA,
+            tipLength=0.08,
+        )
+        writer.write(
+            group,
+            "rectified-pointer-geometry",
+            rectified_overlay,
+            title_zh="姿态校正后的指针几何",
+            operation="affine_transform_center_and_pointer_tip",
+            source_stage="rectified-dial",
+            preserves_aspect_ratio=False,
+            note_zh=(
+                "红箭头由同一仿射变换后的轴心和指针端点构成；"
+                f"最终采用校正角度 {circular_pose.angle_degrees:.2f}°。"
+            ),
+        )
     hidden_estimate: HiddenPivotEstimate | None = None
     if include_hidden_pivot_evidence:
         try:
@@ -2515,23 +2647,59 @@ def _recover_type_specific_pointer_results(
             except ValueError:
                 pass
             else:
+                offset = np.asarray((x1, y1), dtype=np.float64)
+                global_center = center + offset
+                global_tip = tip + offset
+                selected_bbox = _selected_pointer_bbox(
+                    image,
+                    candidates[0],
+                    global_center,
+                    include_outer_label_ring=True,
+                    outer_label_extent_factor=0.68,
+                )
+                selected_x1, selected_y1, selected_x2, selected_y2 = selected_bbox
+                selected_crop = image[
+                    selected_y1:selected_y2,
+                    selected_x1:selected_x2,
+                ]
+                selected_offset = np.asarray(
+                    (selected_x1, selected_y1),
+                    dtype=np.float64,
+                )
+                circular_pose: CircularPointerPose | None = None
+                try:
+                    circular_pose = normalize_circular_pointer_pose(
+                        selected_crop,
+                        global_center - selected_offset,
+                        global_tip - selected_offset,
+                    )
+                except ValueError:
+                    center_method = (
+                        "type-specific:colored-component-pointer+"
+                        "unrectified-pose-fallback"
+                    )
+                else:
+                    angle = circular_pose.angle_degrees
+                    center_method = (
+                        "type-specific:colored-component-pointer+"
+                        "outer-ellipse-affine-rectification"
+                    )
                 step = 360.0 / len(channel.allowed_values)
                 value_index = round(angle / step) % len(channel.allowed_values)
                 raw_value = float(channel.allowed_values[value_index])
-                offset = np.asarray((x1, y1), dtype=np.float64)
                 visual = replace(
                     existing,
                     detected=True,
                     bbox=candidates[0].bbox,
                     detection_confidence=candidates[0].confidence,
                     pointer_found=True,
-                    center=tuple(center + offset),
-                    pointer_tip=tuple(tip + offset),
+                    center=tuple(global_center),
+                    pointer_tip=tuple(global_tip),
                     angle_degrees=angle,
                     reading=raw_value,
                     unit=None,
                     confidence=min(candidates[0].confidence, color_confidence),
-                    center_method="type-specific:colored-component-pointer",
+                    center_method=center_method,
                     failure_reason=None,
                     raw_reading=None,
                     instrument_type_id=None,
@@ -2544,12 +2712,13 @@ def _recover_type_specific_pointer_results(
                     stage_writer,
                     image,
                     candidates[0],
-                    center + offset,
-                    tip + offset,
+                    global_center,
+                    global_tip,
                     group="dial-1-selected-discharge-pointer",
                     method="colored_component_and_hough_line",
                     include_red_mask=True,
                     include_outer_label_ring=True,
+                    circular_pose=circular_pose,
                 )
     return tuple(recovered)
 

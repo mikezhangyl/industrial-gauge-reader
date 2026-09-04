@@ -7,6 +7,7 @@ import numpy as np
 
 from src.gauge_reader import GaugeResult, StageTimings
 from src.instrument_image import (
+    CircularPointerPose,
     HiddenPivotEstimate,
     _recover_type_specific_pointer_results,
     _shm_mechanism_status_analysis,
@@ -503,6 +504,66 @@ class TypeSpecificPointerTests(unittest.TestCase):
         self.assertEqual(recovered[0].reading, 0.0)
         self.assertEqual(recovered[0].angle_degrees, 0.0)
         self.assertIn("colored-component-pointer", recovered[0].center_method)
+
+    def test_discharge_counter_uses_pose_corrected_pointer_angle(self):
+        catalog = InstrumentMetadataCatalog.load()
+        metadata = catalog.get("arrester_discharge_counter")
+        existing = GaugeResult(
+            detected=True,
+            bbox=(20, 20, 180, 180),
+            detection_confidence=0.8,
+            pointer_found=True,
+            center=(100.0, 100.0),
+            pointer_tip=(100.0, 30.0),
+            angle_degrees=0.0,
+            sweep_fraction=None,
+            reading=0.0,
+            unit=None,
+            confidence=0.7,
+            center_method="generic-mask",
+            timings=StageTimings(0.0, 0.0, 0.0),
+        )
+        reader = SimpleNamespace(
+            reading_interpreter=InstrumentReadingInterpreter(catalog)
+        )
+        pose = CircularPointerPose(
+            outer_ellipse=((80.0, 80.0), (140.0, 150.0), 5.0),
+            edge_support=0.92,
+            visible_arc_fraction=1.0,
+            rectification_transform=np.eye(2, 3, dtype=np.float32),
+            rectified_center=np.asarray((80.0, 80.0)),
+            rectified_tip=np.asarray((120.0, 25.0)),
+            angle_degrees=36.0,
+            obliquity_degrees=21.0,
+        )
+
+        with (
+            patch(
+                "src.instrument_image.detect_colored_component_pointer",
+                return_value=(
+                    np.asarray((80.0, 80.0)),
+                    np.asarray((80.0, 10.0)),
+                    0.0,
+                    0.75,
+                ),
+            ),
+            patch(
+                "src.instrument_image.normalize_circular_pointer_pose",
+                return_value=pose,
+            ),
+        ):
+            recovered = _recover_type_specific_pointer_results(
+                np.zeros((200, 200, 3), dtype=np.uint8),
+                metadata,
+                (DialCandidate((20, 20, 180, 180), 0.8),),
+                (existing,),
+                "JS-9 放电计数器",
+                reader,
+            )
+
+        self.assertEqual(recovered[0].reading, 1.0)
+        self.assertEqual(recovered[0].angle_degrees, 36.0)
+        self.assertIn("outer-ellipse-affine-rectification", recovered[0].center_method)
 
     def test_shm_uses_colored_outer_pointer_before_label_ocr(self):
         catalog = InstrumentMetadataCatalog.load()

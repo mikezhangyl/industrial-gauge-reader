@@ -41,6 +41,9 @@ DIAL_RADIUS = RECTIFIED_SIZE * 0.47
 SECTOR_STEP_DEGREES = 15
 NUMBER_PATTERN = re.compile(r"^[+-]?\d+(?:[.,]\d+)?$")
 MINIMUM_SCALE_LABELS = 3
+MINIMUM_DIAL_ELLIPSE_EDGE_SUPPORT = 0.80
+MINIMUM_DIAL_ELLIPSE_VISIBLE_ARC = 0.50
+MINIMUM_PROJECTIVE_DIAL_DIMENSION = 800
 RAPIDOCR_PARAMS: dict[str, object] = {
     "Global.use_cls": False,
     "Global.log_level": "error",
@@ -439,11 +442,777 @@ def select_pointer_segmentation_trace(
     )
 
 
+def _dial_edge_distance(crop: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 120)
+    return cv2.distanceTransform(
+        (edges == 0).astype(np.uint8),
+        cv2.DIST_L2,
+        3,
+    )
+
+
+def ellipse_edge_support(
+    ellipse: Ellipse,
+    *,
+    edge_distance: np.ndarray,
+    image_shape: tuple[int, int],
+) -> tuple[float, float]:
+    """Measure observed edge support for the visible part of an ellipse."""
+
+    height, width = image_shape
+    (center_x, center_y), (axis_a, axis_b), angle = ellipse
+    perimeter = np.asarray(
+        cv2.ellipse2Poly(
+            (round(center_x), round(center_y)),
+            (max(1, round(axis_a / 2.0)), max(1, round(axis_b / 2.0))),
+            round(angle),
+            0,
+            359,
+            2,
+        ),
+        dtype=np.int32,
+    )
+    in_bounds = (
+        (perimeter[:, 0] >= 0)
+        & (perimeter[:, 0] < width)
+        & (perimeter[:, 1] >= 0)
+        & (perimeter[:, 1] < height)
+    )
+    visible_arc_fraction = float(np.mean(in_bounds))
+    if not np.any(in_bounds):
+        return 0.0, visible_arc_fraction
+    visible_points = perimeter[in_bounds]
+    distances = edge_distance[visible_points[:, 1], visible_points[:, 0]]
+    tolerance = max(2.0, 0.008 * min(width, height))
+    return float(np.mean(distances <= tolerance)), visible_arc_fraction
+
+
+def measure_dial_ellipse_quality(
+    crop: np.ndarray,
+    ellipse: Ellipse,
+) -> tuple[float, float]:
+    """Return edge-support and visible-arc fractions for a dial ellipse."""
+
+    return ellipse_edge_support(
+        ellipse,
+        edge_distance=_dial_edge_distance(crop),
+        image_shape=crop.shape[:2],
+    )
+
+
+def _tight_ellipse_edge_score(
+    ellipse: Ellipse,
+    *,
+    edge_distance: np.ndarray,
+    image_shape: tuple[int, int],
+) -> tuple[float, float]:
+    """Score pixel-level alignment without a resolution-sized tolerance band."""
+
+    height, width = image_shape
+    (center_x, center_y), (axis_a, axis_b), angle = ellipse
+    perimeter = np.asarray(
+        cv2.ellipse2Poly(
+            (round(center_x), round(center_y)),
+            (max(1, round(axis_a / 2.0)), max(1, round(axis_b / 2.0))),
+            round(angle),
+            0,
+            359,
+            1,
+        ),
+        dtype=np.int32,
+    )
+    in_bounds = (
+        (perimeter[:, 0] >= 0)
+        & (perimeter[:, 0] < width)
+        & (perimeter[:, 1] >= 0)
+        & (perimeter[:, 1] < height)
+    )
+    visible_arc_fraction = float(np.mean(in_bounds))
+    if not np.any(in_bounds):
+        return 0.0, visible_arc_fraction
+    visible_points = perimeter[in_bounds]
+    distances = edge_distance[visible_points[:, 1], visible_points[:, 0]]
+    sigma = max(1.5, 0.002 * min(height, width))
+    alignment = np.exp(-0.5 * np.square(distances / sigma))
+    return float(np.mean(alignment)), visible_arc_fraction
+
+
+def projective_ellipse_rectification(
+    ellipse: Ellipse,
+    physical_center: np.ndarray,
+) -> np.ndarray:
+    """Map a projected physical circle and its true centre to a front-view circle.
+
+    Under perspective projection the centre of an ellipse is generally not the
+    image of the physical circle centre.  The polar of the physical centre with
+    respect to the ellipse is the dial plane's vanishing line.  Removing that
+    projective component before the metric ellipse correction keeps the pointer
+    pivot and every genuinely concentric ring at the same rectified centre.
+    """
+
+    (center_x, center_y), (axis_a, axis_b), angle = ellipse
+    if min(axis_a, axis_b) <= 0:
+        raise ValueError("Ellipse axes must be positive")
+    theta = math.radians(angle)
+    rotation = np.asarray(
+        (
+            (math.cos(theta), -math.sin(theta)),
+            (math.sin(theta), math.cos(theta)),
+        ),
+        dtype=np.float64,
+    )
+    quadratic = rotation @ np.diag(
+        (4.0 / axis_a**2, 4.0 / axis_b**2)
+    ) @ rotation.T
+    ellipse_center = np.asarray((center_x, center_y), dtype=np.float64)
+    conic = np.zeros((3, 3), dtype=np.float64)
+    conic[:2, :2] = quadratic
+    conic[:2, 2] = -quadratic @ ellipse_center
+    conic[2, :2] = -ellipse_center @ quadratic
+    conic[2, 2] = ellipse_center @ quadratic @ ellipse_center - 1.0
+
+    homogeneous_center = np.append(
+        np.asarray(physical_center, dtype=np.float64).reshape(2),
+        1.0,
+    )
+    vanishing_line = conic @ homogeneous_center
+    if abs(vanishing_line[2]) < 1e-10:
+        raise ValueError("Physical centre produces an unstable vanishing line")
+    vanishing_line /= vanishing_line[2]
+    projective_to_affine = np.asarray(
+        (
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (vanishing_line[0], vanishing_line[1], 1.0),
+        ),
+        dtype=np.float64,
+    )
+
+    inverse_projective = np.linalg.inv(projective_to_affine)
+    affine_conic = inverse_projective.T @ conic @ inverse_projective
+    affine_quadratic = 0.5 * (
+        affine_conic[:2, :2] + affine_conic[:2, :2].T
+    )
+    affine_linear = affine_conic[:2, 2]
+    affine_center = -np.linalg.solve(affine_quadratic, affine_linear)
+    centered_constant = float(
+        affine_conic[2, 2] + affine_linear @ affine_center
+    )
+    normalized_quadratic = affine_quadratic / -centered_constant
+    eigenvalues, eigenvectors = np.linalg.eigh(normalized_quadratic)
+    if np.any(eigenvalues <= 0):
+        raise ValueError("Rectified ellipse is not positive definite")
+    square_root = (
+        eigenvectors @ np.diag(np.sqrt(eigenvalues)) @ eigenvectors.T
+    )
+    linear = DIAL_RADIUS * square_root
+    target_center = np.asarray(
+        (RECTIFIED_SIZE / 2, RECTIFIED_SIZE / 2),
+        dtype=np.float64,
+    )
+    affine_to_circle = np.eye(3, dtype=np.float64)
+    affine_to_circle[:2, :2] = linear
+    affine_to_circle[:2, 2] = target_center - linear @ affine_center
+    transform = affine_to_circle @ projective_to_affine
+
+    # Circle rectification is ambiguous up to an in-plane rotation.  Preserve
+    # the orientation convention of the existing affine rectifier so metadata
+    # dial angles keep the same zero direction while perspective is removed.
+    center_x, center_y = homogeneous_center[:2]
+    denominator = float(
+        transform[2, 0] * center_x
+        + transform[2, 1] * center_y
+        + transform[2, 2]
+    )
+    numerator = transform[:2, :] @ homogeneous_center
+    jacobian = (
+        transform[:2, :2] * denominator
+        - numerator[:, None] * transform[2, :2]
+    ) / denominator**2
+    affine_reference = ellipse_rectification(ellipse)[:, :2].astype(np.float64)
+    rotation_target = affine_reference @ np.linalg.inv(jacobian)
+    left, _, right_transpose = np.linalg.svd(rotation_target)
+    residual_rotation = left @ right_transpose
+    if np.linalg.det(residual_rotation) < 0:
+        left[:, -1] *= -1
+        residual_rotation = left @ right_transpose
+    rotate_about_center = np.eye(3, dtype=np.float64)
+    rotate_about_center[:2, :2] = residual_rotation
+    rotate_about_center[:2, 2] = target_center - residual_rotation @ target_center
+    transform = rotate_about_center @ transform
+
+    transformed_center = transform @ homogeneous_center
+    transformed_center = transformed_center[:2] / transformed_center[2]
+    if np.linalg.norm(transformed_center - target_center) > 1.0:
+        raise ValueError("Projective rectification did not preserve the pivot")
+    return transform.astype(np.float32)
+
+
+def _projective_ring_edge_quality(
+    transform: np.ndarray,
+    radius: float,
+    *,
+    edge_distance: np.ndarray,
+    image_shape: tuple[int, int],
+    angular_step: int = 2,
+) -> float:
+    """Measure distributed source-edge support for one rectified circle."""
+
+    height, width = image_shape
+    phases = np.arange(0, 360, angular_step, dtype=np.float64)
+    radians = np.deg2rad(phases)
+    target_center = np.asarray(
+        (RECTIFIED_SIZE / 2, RECTIFIED_SIZE / 2),
+        dtype=np.float64,
+    )
+    rectified_points = target_center + radius * np.column_stack(
+        (np.cos(radians), np.sin(radians))
+    )
+    inverse = np.linalg.inv(np.asarray(transform, dtype=np.float64).reshape(3, 3))
+    homogeneous = np.column_stack(
+        (rectified_points, np.ones(len(rectified_points), dtype=np.float64))
+    )
+    source_homogeneous = homogeneous @ inverse.T
+    source_points = source_homogeneous[:, :2] / source_homogeneous[:, 2, None]
+    in_bounds = (
+        (source_points[:, 0] >= 0)
+        & (source_points[:, 0] < width - 1)
+        & (source_points[:, 1] >= 0)
+        & (source_points[:, 1] < height - 1)
+    )
+    distances = np.full(len(source_points), 1e6, dtype=np.float32)
+    if np.any(in_bounds):
+        distances[in_bounds] = cv2.remap(
+            edge_distance,
+            source_points[in_bounds, 0].astype(np.float32),
+            source_points[in_bounds, 1].astype(np.float32),
+            cv2.INTER_LINEAR,
+        ).reshape(-1)
+    sigma = max(1.5, 0.002 * min(height, width))
+    alignment = np.exp(-0.5 * np.square(distances / sigma))
+    sector_means = np.asarray(
+        [
+            float(np.mean(alignment[(phases >= start) & (phases < start + 15)]))
+            for start in range(0, 360, 15)
+        ],
+        dtype=np.float64,
+    )
+    # Ignore at most five occluded sectors, but require the remaining support to
+    # be distributed.  A shadow arc cannot win merely by being locally strong.
+    distributed_support = float(np.mean(np.sort(sector_means)[5:]))
+    coverage = float(np.mean(sector_means > 0.12))
+    return (
+        0.65 * distributed_support
+        + 0.35 * float(np.mean(alignment))
+        + 0.10 * coverage
+    )
+
+
+def _projectively_concentric_ring_support(
+    edge_distance: np.ndarray,
+    image_shape: tuple[int, int],
+    ellipse: Ellipse,
+    physical_center: np.ndarray,
+    *,
+    angular_step: int,
+) -> tuple[float, float, float, np.ndarray]:
+    transform = projective_ellipse_rectification(ellipse, physical_center)
+    outer_support = _projective_ring_edge_quality(
+        transform,
+        DIAL_RADIUS,
+        edge_distance=edge_distance,
+        image_shape=image_shape,
+        angular_step=angular_step,
+    )
+    inner_candidates = [
+        (
+            _projective_ring_edge_quality(
+                transform,
+                DIAL_RADIUS * fraction,
+                edge_distance=edge_distance,
+                image_shape=image_shape,
+                angular_step=angular_step,
+            ),
+            fraction,
+        )
+        for fraction in np.arange(0.68, 0.881, 0.025)
+    ]
+    inner_support, inner_radius_fraction = max(inner_candidates)
+    return (
+        outer_support,
+        inner_support,
+        float(inner_radius_fraction),
+        transform,
+    )
+
+
+def measure_projectively_concentric_ring_support(
+    crop: np.ndarray,
+    ellipse: Ellipse,
+    physical_center: np.ndarray,
+) -> tuple[float, float, float]:
+    """Return support for distinct outer/inner rings under one camera pose."""
+
+    outer, inner, fraction, _ = _projectively_concentric_ring_support(
+        _dial_edge_distance(crop),
+        (crop.shape[0], crop.shape[1]),
+        ellipse,
+        physical_center,
+        angular_step=1,
+    )
+    return outer, inner, fraction
+
+
+def refine_dial_ellipse_from_concentric_rings(
+    crop: np.ndarray,
+    pointer_mask: np.ndarray,
+    pose_prior: Ellipse,
+) -> Ellipse:
+    """Recover an outer rim only when a second concentric ring confirms it."""
+
+    edge_distance = _dial_edge_distance(crop)
+    height, width = crop.shape[:2]
+    image_scale = float(min(height, width))
+    physical_center, has_visible_hub = _detect_visible_pointer_hub_evidence(
+        crop,
+        pointer_mask,
+        pose_prior,
+    )
+    if not has_visible_hub:
+        return pose_prior
+    prior_center = np.asarray(pose_prior[0], dtype=np.float64)
+    prior_minor, prior_major = sorted(pose_prior[1])
+    prior_ratio = prior_minor / max(prior_major, 1.0)
+    prior_major_orientation = (
+        pose_prior[2]
+        if pose_prior[1][0] >= pose_prior[1][1]
+        else pose_prior[2] + 90.0
+    ) % 180.0
+
+    def ellipse_from_parameters(parameters: np.ndarray) -> Ellipse:
+        center_x, center_y, ratio, orientation, major = parameters
+        return (
+            (float(center_x), float(center_y)),
+            (float(major * ratio), float(major)),
+            float((orientation - 90.0) % 180.0),
+        )
+
+    def evaluate(parameters: np.ndarray, *, angular_step: int) -> float:
+        center_x, center_y, ratio, orientation, major = parameters
+        ellipse = ellipse_from_parameters(parameters)
+        orientation_delta = abs(
+            (orientation - prior_major_orientation + 90.0) % 180.0 - 90.0
+        )
+        if (
+            not 0.60 <= ratio <= 1.0
+            or not 0.88 * prior_major <= major <= 1.25 * prior_major
+            or orientation_delta > 24.0
+            or np.linalg.norm(
+                np.asarray((center_x, center_y), dtype=np.float64)
+                - physical_center
+            )
+            > 0.15 * major
+            or not ellipse_fits_crop(
+                ellipse,
+                (height, width),
+                tolerance_fraction=0.06,
+            )
+        ):
+            return -1.0
+        try:
+            outer, inner, _, _ = _projectively_concentric_ring_support(
+                edge_distance,
+                (height, width),
+                ellipse,
+                physical_center,
+                angular_step=angular_step,
+            )
+        except (ValueError, np.linalg.LinAlgError):
+            return -1.0
+        return min(outer, inner) + 0.35 * (outer + inner)
+
+    center_delta = physical_center - prior_center
+    seeds: list[tuple[float, np.ndarray]] = []
+    for interpolation in (0.25, 0.40, 0.55, 0.70):
+        interpolated_center = prior_center + interpolation * center_delta
+        for offset_x in (-0.01, 0.0, 0.01):
+            for offset_y in (-0.01, 0.0, 0.01):
+                for ratio_delta in (-0.09, -0.06, -0.03, 0.0, 0.03):
+                    for orientation_delta in (-18, -12, -6, 0, 6, 12, 18):
+                        for major_scale in (0.96, 1.02, 1.08, 1.14, 1.20):
+                            parameters = np.asarray(
+                                (
+                                    interpolated_center[0]
+                                    + offset_x * image_scale,
+                                    interpolated_center[1]
+                                    + offset_y * image_scale,
+                                    prior_ratio + ratio_delta,
+                                    prior_major_orientation + orientation_delta,
+                                    prior_major * major_scale,
+                                ),
+                                dtype=np.float64,
+                            )
+                            score = evaluate(parameters, angular_step=3)
+                            if score >= 0:
+                                seeds.append((score, parameters))
+    if not seeds:
+        return pose_prior
+    seeds.sort(key=lambda item: item[0], reverse=True)
+
+    refined: list[tuple[float, np.ndarray]] = []
+    step_levels = (
+        (0.008 * image_scale, 0.008 * image_scale, 0.015, 2.0, 0.025 * prior_major),
+        (0.003 * image_scale, 0.003 * image_scale, 0.006, 0.8, 0.010 * prior_major),
+        (0.001 * image_scale, 0.001 * image_scale, 0.002, 0.3, 0.004 * prior_major),
+    )
+    for _, seed in seeds[:8]:
+        parameters = seed.copy()
+        best_score = evaluate(parameters, angular_step=1)
+        for steps in step_levels:
+            for _ in range(24):
+                improved = False
+                for index, step in enumerate(steps):
+                    for direction in (-1.0, 1.0):
+                        candidate = parameters.copy()
+                        candidate[index] += direction * step
+                        score = evaluate(candidate, angular_step=1)
+                        if score > best_score + 1e-9:
+                            parameters = candidate
+                            best_score = score
+                            improved = True
+                if not improved:
+                    break
+        refined.append((best_score, parameters))
+
+    best_score, best_parameters = max(refined, key=lambda item: item[0])
+    prior_score = evaluate(
+        np.asarray(
+            (
+                prior_center[0],
+                prior_center[1],
+                prior_ratio,
+                prior_major_orientation,
+                prior_major,
+            ),
+            dtype=np.float64,
+        ),
+        angular_step=1,
+    )
+    best_ellipse = ellipse_from_parameters(best_parameters)
+    outer, inner, _, _ = _projectively_concentric_ring_support(
+        edge_distance,
+        (height, width),
+        best_ellipse,
+        physical_center,
+        angular_step=1,
+    )
+    if (
+        best_score < max(0.55, prior_score + 0.08)
+        or outer < 0.30
+        or inner < 0.25
+    ):
+        return pose_prior
+    return best_ellipse
+
+
+def refine_dial_ellipse_from_pose_prior(
+    crop: np.ndarray,
+    pointer_mask: np.ndarray,
+    pose_prior: Ellipse,
+) -> Ellipse:
+    """Snap a coherent contour pose to one physical rim near the pointer hub.
+
+    A broad edge search can combine fragments from several concentric rings and
+    nearby housing edges.  The long contour supplies the camera-pose signature
+    (axis ratio and orientation); this refinement may adjust its centre and size,
+    but cannot jump to an unrelated, larger ellipse with a different pose.
+    """
+
+    edge_distance = _dial_edge_distance(crop)
+    height, width = crop.shape[:2]
+    scale = float(min(height, width))
+    pointer_center, _ = pointer_center_and_tip(pointer_mask)
+    (_, _), (prior_axis_a, prior_axis_b), prior_angle = pose_prior
+
+    def evaluate(parameters: np.ndarray) -> tuple[float, float, Ellipse]:
+        center_x, center_y, common_scale, anisotropy, angle_delta = parameters
+        axis_a = prior_axis_a * common_scale * (1.0 + anisotropy)
+        axis_b = prior_axis_b * common_scale * (1.0 - anisotropy)
+        ellipse: Ellipse = (
+            (float(center_x), float(center_y)),
+            (float(axis_a), float(axis_b)),
+            float((prior_angle + angle_delta) % 180.0),
+        )
+        minor, major = sorted((axis_a, axis_b))
+        if (
+            minor < 0.25 * scale
+            or major > 1.30 * max(height, width)
+            or minor / max(major, 1.0) < 0.30
+            or np.linalg.norm(np.asarray((center_x, center_y)) - pointer_center)
+            > 0.025 * scale
+            or not ellipse_fits_crop(
+                ellipse,
+                (height, width),
+                tolerance_fraction=0.06,
+            )
+        ):
+            return -1.0, 0.0, ellipse
+        score, visible_arc = _tight_ellipse_edge_score(
+            ellipse,
+            edge_distance=edge_distance,
+            image_shape=(height, width),
+        )
+        return score, visible_arc, ellipse
+
+    seeds: list[tuple[float, np.ndarray]] = []
+    for center_x_offset in (-0.01, 0.0, 0.01):
+        for center_y_offset in (-0.01, 0.0, 0.01):
+            # Refinement may snap inward to a cleaner concentric ring, but it
+            # must not expand a valid contour pose into the surrounding housing.
+            for common_scale in np.arange(0.84, 1.021, 0.02):
+                for anisotropy in (-0.04, -0.02, 0.0, 0.02, 0.04):
+                    for angle_delta in range(-10, 11, 2):
+                        parameters = np.asarray(
+                            (
+                                pointer_center[0] + center_x_offset * scale,
+                                pointer_center[1] + center_y_offset * scale,
+                                common_scale,
+                                anisotropy,
+                                float(angle_delta),
+                            ),
+                            dtype=np.float64,
+                        )
+                        score, visible_arc, _ = evaluate(parameters)
+                        if visible_arc >= MINIMUM_DIAL_ELLIPSE_VISIBLE_ARC:
+                            seeds.append((score, parameters))
+    seeds.sort(key=lambda item: item[0], reverse=True)
+    if not seeds:
+        return pose_prior
+
+    best_score, best_parameters = seeds[0]
+    step_levels = (
+        (0.005 * scale, 0.005 * scale, 0.010, 0.010, 1.5),
+        (0.002 * scale, 0.002 * scale, 0.004, 0.004, 0.6),
+    )
+    for steps in step_levels:
+        for _ in range(30):
+            improved = False
+            for index, step in enumerate(steps):
+                for direction in (-1.0, 1.0):
+                    candidate = best_parameters.copy()
+                    candidate[index] += direction * step
+                    score, visible_arc, _ = evaluate(candidate)
+                    if (
+                        visible_arc >= MINIMUM_DIAL_ELLIPSE_VISIBLE_ARC
+                        and score > best_score + 1e-9
+                    ):
+                        best_score = score
+                        best_parameters = candidate
+                        improved = True
+            if not improved:
+                break
+
+    prior_score, _, _ = evaluate(
+        np.asarray(
+            (
+                pose_prior[0][0],
+                pose_prior[0][1],
+                1.0,
+                0.0,
+                0.0,
+            ),
+            dtype=np.float64,
+        )
+    )
+    _, _, best_ellipse = evaluate(best_parameters)
+    if best_score < max(0.18, prior_score + 0.015):
+        return pose_prior
+    return best_ellipse
+
+
+def _detect_visible_pointer_hub_evidence(
+    crop: np.ndarray,
+    pointer_mask: np.ndarray,
+    dial_ellipse: Ellipse,
+) -> tuple[np.ndarray, bool]:
+    """Prefer a visible metallic pointer hub over a nearby shadow blob.
+
+    Pointer segmentation can merge the dark hub shadow into the pointer and
+    shift its component centre.  A real exposed hub usually supplies a compact
+    circular edge with a specular highlight; a shadow circle is dark inside.
+    Only circles very near the segmentation centre are considered, and the
+    segmentation centre remains the fallback for matte or hidden pivots.
+    """
+
+    segmentation_center, _ = pointer_center_and_tip(pointer_mask)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    minimum_dimension = min(gray.shape)
+    circles = cv2.HoughCircles(
+        cv2.GaussianBlur(gray, (5, 5), 1.0),
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(10, round(minimum_dimension * 0.03)),
+        param1=80,
+        param2=20,
+        minRadius=max(3, round(minimum_dimension * 0.008)),
+        maxRadius=max(6, round(minimum_dimension * 0.06)),
+    )
+    if circles is None:
+        return segmentation_center, False
+
+    major_axis = max(dial_ellipse[1])
+    candidates: list[tuple[float, np.ndarray]] = []
+    yy, xx = np.ogrid[: gray.shape[0], : gray.shape[1]]
+    for center_x, center_y, radius in circles[0]:
+        center = np.asarray((center_x, center_y), dtype=np.float64)
+        distance = float(np.linalg.norm(center - segmentation_center))
+        if distance > 0.035 * major_axis:
+            continue
+        interior = (
+            np.square(xx - center_x) + np.square(yy - center_y)
+            <= np.square(0.70 * radius)
+        )
+        values = gray[interior]
+        if values.size < 10:
+            continue
+        bright_percentile = float(np.percentile(values, 90))
+        if bright_percentile < 170.0:
+            continue
+        variation = float(np.std(values))
+        score = bright_percentile + 0.5 * variation - 0.25 * distance
+        candidates.append((score, center))
+    if not candidates:
+        return segmentation_center, False
+    return max(candidates, key=lambda item: item[0])[1], True
+
+
+def detect_visible_pointer_hub(
+    crop: np.ndarray,
+    pointer_mask: np.ndarray,
+    dial_ellipse: Ellipse,
+) -> np.ndarray:
+    """Return the visible hub centre, or the segmentation fallback."""
+
+    return _detect_visible_pointer_hub_evidence(
+        crop,
+        pointer_mask,
+        dial_ellipse,
+    )[0]
+
+
+def _search_edge_supported_dial_ellipse(
+    crop: np.ndarray,
+    pointer_mask: np.ndarray,
+    *,
+    edge_distance: np.ndarray,
+) -> Ellipse:
+    """Recover a broken outer rim by optimizing only measurable edge support."""
+
+    height, width = crop.shape[:2]
+    scale = float(min(height, width))
+    center_prior, _ = pointer_center_and_tip(pointer_mask)
+
+    def evaluate(parameters: np.ndarray) -> tuple[float, float, Ellipse]:
+        center_x, center_y, axis_a, axis_b, angle = parameters
+        ellipse: Ellipse = (
+            (float(center_x), float(center_y)),
+            (float(axis_a), float(axis_b)),
+            float(angle % 180.0),
+        )
+        minor, major = sorted((axis_a, axis_b))
+        center_error = float(
+            np.linalg.norm(np.asarray((center_x, center_y)) - center_prior) / scale
+        )
+        if (
+            minor < 0.55 * scale
+            or major > 1.20 * max(height, width)
+            or minor / max(major, 1.0) < 0.60
+            or center_error > 0.08
+            or not ellipse_fits_crop(
+                ellipse,
+                (height, width),
+                tolerance_fraction=0.10,
+            )
+        ):
+            return -1.0, 0.0, ellipse
+        support, visible_arc = ellipse_edge_support(
+            ellipse,
+            edge_distance=edge_distance,
+            image_shape=(height, width),
+        )
+        return support, visible_arc, ellipse
+
+    seeds: list[tuple[float, np.ndarray]] = []
+    for center_x_offset in (-0.04, -0.02, 0.0, 0.02, 0.04):
+        for center_y_offset in (-0.04, -0.02, 0.0, 0.02, 0.04):
+            for minor_fraction in (0.62, 0.70, 0.78, 0.86):
+                minor = minor_fraction * scale
+                for axis_ratio in (0.72, 0.78, 0.84, 0.90, 0.96, 1.0):
+                    major = minor / axis_ratio
+                    for angle in range(0, 180, 15):
+                        parameters = np.asarray(
+                            (
+                                center_prior[0] + center_x_offset * scale,
+                                center_prior[1] + center_y_offset * scale,
+                                minor,
+                                major,
+                                float(angle),
+                            ),
+                            dtype=np.float64,
+                        )
+                        support, visible_arc, _ = evaluate(parameters)
+                        if visible_arc >= MINIMUM_DIAL_ELLIPSE_VISIBLE_ARC:
+                            seeds.append((support, parameters))
+    seeds.sort(key=lambda item: item[0], reverse=True)
+
+    refined: list[tuple[float, float, Ellipse]] = []
+    step_levels = (
+        (0.015 * scale, 0.015 * scale, 0.025 * scale, 0.025 * scale, 5.0),
+        (0.006 * scale, 0.006 * scale, 0.010 * scale, 0.010 * scale, 2.0),
+        (0.002 * scale, 0.002 * scale, 0.004 * scale, 0.004 * scale, 0.7),
+    )
+    for initial_support, initial_parameters in seeds[:24]:
+        parameters = initial_parameters.copy()
+        best_support = initial_support
+        for steps in step_levels:
+            for _ in range(40):
+                improved = False
+                for index, step in enumerate(steps):
+                    for direction in (-1.0, 1.0):
+                        candidate = parameters.copy()
+                        candidate[index] += direction * step
+                        support, visible_arc, _ = evaluate(candidate)
+                        if (
+                            visible_arc >= MINIMUM_DIAL_ELLIPSE_VISIBLE_ARC
+                            and support > best_support + 1e-9
+                        ):
+                            parameters = candidate
+                            best_support = support
+                            improved = True
+                if not improved:
+                    break
+        support, visible_arc, ellipse = evaluate(parameters)
+        if (
+            support >= MINIMUM_DIAL_ELLIPSE_EDGE_SUPPORT
+            and visible_arc >= MINIMUM_DIAL_ELLIPSE_VISIBLE_ARC
+        ):
+            refined.append((min(ellipse[1]), support, ellipse))
+    if not refined:
+        raise ValueError("Could not find an edge-supported dial ellipse")
+    return max(refined, key=lambda item: (item[0], item[1]))[-1]
+
+
 def detect_dial_ellipse(crop: np.ndarray, pointer_mask: np.ndarray) -> Ellipse:
-    """Find the dial rim from edges, using only the pointer mask as a center prior."""
+    """Find and validate a physical dial rim before pose rectification."""
     center_prior, _ = pointer_center_and_tip(pointer_mask)
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 120)
+    edge_distance = cv2.distanceTransform(
+        (edges == 0).astype(np.uint8),
+        cv2.DIST_L2,
+        3,
+    )
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     height, width = crop.shape[:2]
     candidates: list[tuple[float, float, Ellipse]] = []
@@ -462,7 +1231,10 @@ def detect_dial_ellipse(crop: np.ndarray, pointer_mask: np.ndarray) -> Ellipse:
             continue
         if major > width * 1.30 or minor > height * 1.30 or minor / major < 0.20:
             continue
-        if not ellipse_fits_crop(ellipse, crop.shape[:2], tolerance_fraction=0.03):
+        # A tight detector crop may clip one side of an otherwise long physical
+        # rim.  Keep its ratio/orientation as a pose prior; the later hub-centred
+        # refinement must still fit the actual crop before it can be returned.
+        if not ellipse_fits_crop(ellipse, crop.shape[:2], tolerance_fraction=0.10):
             continue
         points = contour[:, 0, :].astype(np.float64)
         contour_error = float(np.median(ellipse_residual(ellipse, points)))
@@ -478,16 +1250,64 @@ def detect_dial_ellipse(crop: np.ndarray, pointer_mask: np.ndarray) -> Ellipse:
             (geometry_error + outer_rim_penalty, geometry_error, ellipse)
         )
     if not candidates:
-        raise ValueError("Could not find a stable dial ellipse")
+        return _search_edge_supported_dial_ellipse(
+            crop,
+            pointer_mask,
+            edge_distance=edge_distance,
+        )
     _, geometry_error, ellipse = select_consensus_dial_ellipse(
         candidates,
         pointer_mask,
     )
     if geometry_error > 0.15:
-        raise ValueError(
-            f"Dial ellipse confidence is too low: score={geometry_error:.3f}"
+        return _search_edge_supported_dial_ellipse(
+            crop,
+            pointer_mask,
+            edge_distance=edge_distance,
         )
-    return refine_dial_ellipse_center(crop, pointer_mask, ellipse)
+    refined = refine_dial_ellipse_center(crop, pointer_mask, ellipse)
+    center_was_repaired = (
+        np.linalg.norm(
+            np.asarray(refined[0], dtype=np.float64)
+            - np.asarray(ellipse[0], dtype=np.float64)
+        )
+        > 1.0
+    )
+    if (
+        center_was_repaired
+        and min(crop.shape[:2]) >= MINIMUM_PROJECTIVE_DIAL_DIMENSION
+    ):
+        paired_rim = refine_dial_ellipse_from_concentric_rings(
+            crop,
+            pointer_mask,
+            ellipse,
+        )
+        if paired_rim != ellipse:
+            return paired_rim
+        return refine_dial_ellipse_from_pose_prior(crop, pointer_mask, refined)
+
+    reliable: list[tuple[float, float, Ellipse]] = []
+    for candidate_ellipse in (refined, ellipse, *(item[2] for item in candidates)):
+        support, visible_arc = ellipse_edge_support(
+            candidate_ellipse,
+            edge_distance=edge_distance,
+            image_shape=crop.shape[:2],
+        )
+        if (
+            support >= MINIMUM_DIAL_ELLIPSE_EDGE_SUPPORT
+            and visible_arc >= MINIMUM_DIAL_ELLIPSE_VISIBLE_ARC
+        ):
+            reliable.append((min(candidate_ellipse[1]), support, candidate_ellipse))
+    if reliable:
+        return max(reliable, key=lambda item: (item[0], item[1]))[-1]
+    try:
+        return _search_edge_supported_dial_ellipse(
+            crop,
+            pointer_mask,
+            edge_distance=edge_distance,
+        )
+    except ValueError:
+        return refined
 
 
 def select_hub_consistent_ellipse_center(
@@ -710,15 +1530,80 @@ def ellipse_rectification(ellipse: Ellipse) -> np.ndarray:
     return np.column_stack((scale, translation)).astype(np.float32)
 
 
-def rectify_dial(crop: np.ndarray, ellipse: Ellipse) -> tuple[np.ndarray, np.ndarray]:
-    transform = ellipse_rectification(ellipse)
-    rectified = cv2.warpAffine(
-        crop,
+def projected_concentric_ellipse(
+    transform: np.ndarray,
+    radius_fraction: float,
+) -> Ellipse:
+    """Project a rectified concentric circle back into the source image."""
+
+    phases = np.deg2rad(np.arange(0, 360, 2, dtype=np.float32))
+    center = RECTIFIED_SIZE / 2
+    radius = DIAL_RADIUS * radius_fraction
+    rectified_points = np.column_stack(
+        (center + radius * np.cos(phases), center + radius * np.sin(phases))
+    ).astype(np.float32)
+    inverse = np.linalg.inv(np.asarray(transform, dtype=np.float64).reshape(3, 3))
+    source_points = cv2.perspectiveTransform(
+        rectified_points.reshape(-1, 1, 2),
+        inverse,
+    )
+    raw = cv2.fitEllipse(source_points)
+    return (
+        (float(raw[0][0]), float(raw[0][1])),
+        (float(raw[1][0]), float(raw[1][1])),
+        float(raw[2]),
+    )
+
+
+def _warp_rectified(
+    image: np.ndarray,
+    transform: np.ndarray,
+    *,
+    flags: int,
+) -> np.ndarray:
+    if np.asarray(transform).shape == (3, 3):
+        return cv2.warpPerspective(
+            image,
+            transform,
+            (RECTIFIED_SIZE, RECTIFIED_SIZE),
+            flags=flags,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+    return cv2.warpAffine(
+        image,
         transform,
         (RECTIFIED_SIZE, RECTIFIED_SIZE),
-        flags=cv2.INTER_CUBIC,
+        flags=flags,
         borderMode=cv2.BORDER_REPLICATE,
     )
+
+
+def _inverse_rectified_point(
+    transform: np.ndarray,
+    point: np.ndarray,
+) -> np.ndarray:
+    raw_transform = np.asarray(transform, dtype=np.float64)
+    raw_point = np.asarray(point, dtype=np.float64).reshape(2)
+    if raw_transform.shape == (3, 3):
+        inverse = np.linalg.inv(raw_transform)
+        homogeneous = inverse @ np.append(raw_point, 1.0)
+        return homogeneous[:2] / homogeneous[2]
+    inverse = cv2.invertAffineTransform(raw_transform.reshape(2, 3))
+    return inverse @ np.append(raw_point, 1.0)
+
+
+def rectify_dial(
+    crop: np.ndarray,
+    ellipse: Ellipse,
+    *,
+    physical_center: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    transform = (
+        ellipse_rectification(ellipse)
+        if physical_center is None
+        else projective_ellipse_rectification(ellipse, physical_center)
+    )
+    rectified = _warp_rectified(crop, transform, flags=cv2.INTER_CUBIC)
     return rectified, transform
 
 
@@ -1664,23 +2549,118 @@ class EthzPaddleGaugeReader:
 
         try:
             ellipse = detect_dial_ellipse(crop, mask)
+            physical_center, has_visible_hub = _detect_visible_pointer_hub_evidence(
+                crop,
+                mask,
+                ellipse,
+            )
+            ellipse_edge_support_fraction, ellipse_visible_arc_fraction = (
+                measure_dial_ellipse_quality(crop, ellipse)
+            )
+            paired_ring_evidence = False
+            projective_transform: np.ndarray | None = None
+            inner_ring_support = 0.0
+            inner_radius_fraction = 0.0
+            try:
+                (
+                    outer_ring_support,
+                    inner_ring_support,
+                    inner_radius_fraction,
+                    candidate_projective_transform,
+                ) = _projectively_concentric_ring_support(
+                    _dial_edge_distance(crop),
+                    (crop.shape[0], crop.shape[1]),
+                    ellipse,
+                    physical_center,
+                    angular_step=1,
+                )
+                paired_ring_evidence = (
+                    min(crop.shape[:2]) >= MINIMUM_PROJECTIVE_DIAL_DIMENSION
+                    and has_visible_hub
+                    and outer_ring_support >= 0.30
+                    and inner_ring_support >= 0.25
+                )
+                center_offset_fraction = float(
+                    np.linalg.norm(np.asarray(ellipse[0]) - physical_center)
+                    / max(ellipse[1])
+                )
+                if paired_ring_evidence and center_offset_fraction >= 0.015:
+                    projective_transform = candidate_projective_transform
+            except (ValueError, np.linalg.LinAlgError):
+                pass
+            ellipse_evidence = (
+                "透视同心双环路径"
+                if paired_ring_evidence
+                else (
+                    "强边缘路径"
+                    if ellipse_edge_support_fraction
+                    >= MINIMUM_DIAL_ELLIPSE_EDGE_SUPPORT
+                    else "轮廓姿态约束路径"
+                )
+            )
             if stage_writer is not None:
+                ellipse_overlay = draw_ellipse(crop, ellipse)
+                if paired_ring_evidence and projective_transform is not None:
+                    inner_ellipse = projected_concentric_ellipse(
+                        projective_transform,
+                        inner_radius_fraction,
+                    )
+                    cv2.ellipse(
+                        ellipse_overlay,
+                        inner_ellipse,
+                        (255, 0, 255),
+                        max(2, round(min(crop.shape[:2]) * 0.003)),
+                        cv2.LINE_AA,
+                    )
+                    cv2.circle(
+                        ellipse_overlay,
+                        tuple(np.rint(physical_center).astype(int)),
+                        max(4, round(min(crop.shape[:2]) * 0.008)),
+                        (255, 120, 0),
+                        3,
+                        cv2.LINE_AA,
+                    )
                 stage_writer.write(
                     stage_group,
                     "fitted-ellipse",
-                    draw_ellipse(crop, ellipse),
-                    title_zh="表盘椭圆拟合结果",
-                    operation="edge_ellipse_fit_overlay",
+                    ellipse_overlay,
+                    title_zh=(
+                        "表盘透视同心双环拟合结果"
+                        if paired_ring_evidence
+                        else "表盘椭圆拟合结果"
+                    ),
+                    operation=(
+                        "projectively_concentric_outer+inner_ring_overlay"
+                        if paired_ring_evidence
+                        else "edge_ellipse_fit_overlay"
+                    ),
                     source_stage="geometry-crop",
                     preserves_aspect_ratio=True,
-                    note_zh="仅叠加拟合椭圆；底图像素尺寸未改变。",
+                    note_zh=(
+                        "底图像素尺寸未改变。绿色为物理外圈；"
+                        + (
+                            "紫色为经同一透视姿态验证的内圈，蓝点为指针轴心；"
+                            f"内圈支持 {inner_ring_support:.1%}，"
+                            f"校正后半径比例 {inner_radius_fraction:.3f}。"
+                            if paired_ring_evidence
+                            else "当前没有足够的独立内圈证据；"
+                        )
+                        +
+                        f"可见圆弧边缘贴合率 "
+                        f"{ellipse_edge_support_fraction:.1%}，"
+                        f"可见圆弧比例 {ellipse_visible_arc_fraction:.1%}；"
+                        f"采用{ellipse_evidence}。"
+                    ),
                 )
-            rectified, transform = rectify_dial(crop, ellipse)
-            rectified_mask = cv2.warpAffine(
-                mask,
-                transform,
-                (RECTIFIED_SIZE, RECTIFIED_SIZE),
-                flags=cv2.INTER_NEAREST,
+            rectified, transform = rectify_dial(
+                crop,
+                ellipse,
+                physical_center=(
+                    physical_center if projective_transform is not None else None
+                ),
+            )
+            rectified_mask = _warp_rectified(
+                mask, transform, flags=cv2.INTER_NEAREST
             )
             rectified_center = np.asarray(
                 (RECTIFIED_SIZE / 2, RECTIFIED_SIZE / 2), dtype=np.float64
@@ -1724,14 +2704,53 @@ class EthzPaddleGaugeReader:
                         segmentation_trace.crop,
                         segmentation_trace.mask,
                     )
+                    (
+                        analysis_physical_center,
+                        analysis_has_visible_hub,
+                    ) = _detect_visible_pointer_hub_evidence(
+                        segmentation_trace.crop,
+                        segmentation_trace.mask,
+                        analysis_ellipse,
+                    )
+                    analysis_projective = False
+                    try:
+                        analysis_outer, analysis_inner, _, _ = (
+                            _projectively_concentric_ring_support(
+                                _dial_edge_distance(segmentation_trace.crop),
+                                (
+                                    segmentation_trace.crop.shape[0],
+                                    segmentation_trace.crop.shape[1],
+                                ),
+                                analysis_ellipse,
+                                analysis_physical_center,
+                                angular_step=2,
+                            )
+                        )
+                        analysis_projective = (
+                            min(segmentation_trace.crop.shape[:2])
+                            >= MINIMUM_PROJECTIVE_DIAL_DIMENSION
+                            and analysis_has_visible_hub
+                            and analysis_outer >= 0.30
+                            and analysis_inner >= 0.25
+                            and np.linalg.norm(
+                                np.asarray(analysis_ellipse[0])
+                                - analysis_physical_center
+                            )
+                            / max(analysis_ellipse[1])
+                            >= 0.015
+                        )
+                    except (ValueError, np.linalg.LinAlgError):
+                        pass
                     analysis_rectified, analysis_transform = rectify_dial(
                         segmentation_trace.crop,
                         analysis_ellipse,
+                        physical_center=(
+                            analysis_physical_center if analysis_projective else None
+                        ),
                     )
-                    analysis_rectified_mask = cv2.warpAffine(
+                    analysis_rectified_mask = _warp_rectified(
                         segmentation_trace.mask,
                         analysis_transform,
-                        (RECTIFIED_SIZE, RECTIFIED_SIZE),
                         flags=cv2.INTER_NEAREST,
                     )
                     analysis_center = np.asarray(
@@ -1765,20 +2784,33 @@ class EthzPaddleGaugeReader:
                     "rectified-dial",
                     rectified,
                     title_zh="椭圆校正后的表盘",
-                    operation=f"affine_warp_to_{RECTIFIED_SIZE}x{RECTIFIED_SIZE}",
+                    operation=(
+                        f"projective_warp_to_{RECTIFIED_SIZE}x{RECTIFIED_SIZE}"
+                        if projective_transform is not None
+                        else f"affine_warp_to_{RECTIFIED_SIZE}x{RECTIFIED_SIZE}"
+                    ),
                     source_stage="geometry-crop",
                     preserves_aspect_ratio=False,
-                    note_zh="将斜拍椭圆表盘校正到固定正方形坐标系。",
+                    note_zh=(
+                        "用同一透视变换将内外物理圆环和指针轴心校正到"
+                        "同心正视坐标。"
+                        if projective_transform is not None
+                        else "将斜拍椭圆表盘校正到固定正方形坐标系。"
+                    ),
                 )
                 stage_writer.write(
                     stage_group,
                     "rectified-pointer-mask",
                     rectified_mask,
                     title_zh="校正后的指针掩膜",
-                    operation=f"affine_mask_warp_to_{RECTIFIED_SIZE}x{RECTIFIED_SIZE}",
+                    operation=(
+                        f"projective_mask_warp_to_{RECTIFIED_SIZE}x{RECTIFIED_SIZE}"
+                        if projective_transform is not None
+                        else f"affine_mask_warp_to_{RECTIFIED_SIZE}x{RECTIFIED_SIZE}"
+                    ),
                     source_stage="geometry-mask",
                     preserves_aspect_ratio=False,
-                    note_zh="使用与表盘相同的仿射矩阵，最近邻插值。",
+                    note_zh="使用与表盘相同的校正矩阵，最近邻插值。",
                 )
                 stage_writer.write(
                     stage_group,
@@ -1888,11 +2920,8 @@ class EthzPaddleGaugeReader:
             (2 * DIAL_RADIUS, 2 * DIAL_RADIUS),
             0.0,
         )
-        inverse = cv2.invertAffineTransform(transform)
-        crop_center = inverse @ np.asarray(
-            (rectified_center[0], rectified_center[1], 1.0)
-        )
-        crop_tip = inverse @ np.asarray((rectified_tip[0], rectified_tip[1], 1.0))
+        crop_center = _inverse_rectified_point(transform, rectified_center)
+        crop_tip = _inverse_rectified_point(transform, rectified_tip)
         detail_global_center = crop_center + np.asarray((detail_x1, detail_y1))
         detail_global_tip = crop_tip + np.asarray((detail_x1, detail_y1))
         global_center = analysis_point(detail_global_center)
