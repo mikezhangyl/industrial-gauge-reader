@@ -189,7 +189,7 @@ def load_completed_report(
     expected_profile: str,
     expected_images: list[str],
     started_ns: int,
-    freshness_mtime_skew_ns: int = 0,
+    freshness_mtime_skew_ns: int = FRESHNESS_MTIME_SKEW_NS,
 ) -> dict[str, Any]:
     """Load only artifacts freshly and completely written by the current command."""
 
