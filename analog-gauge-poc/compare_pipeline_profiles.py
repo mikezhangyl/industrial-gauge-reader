@@ -24,6 +24,11 @@ from src.profile_comparison import compare_profile_payloads
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_PROFILE_NAMES = ("448", "640")
+# Some container/overlay filesystems report a freshly written file a few
+# hundred microseconds before the parent process's wall-clock sample.  Keep
+# this tolerance deliberately small; stale artifacts are removed before each
+# profile run below, so this only covers filesystem timestamp skew.
+FRESHNESS_MTIME_SKEW_NS = 1_000_000
 
 
 def main() -> int:
@@ -112,6 +117,11 @@ def _run_batch(
     for profile_name in profile_names:
         profile_dir = output_dir / profile_name / batch_key
         json_path = profile_dir / "instrument-report.json"
+        # A prior report must never be mistaken for a successful current run.
+        # Removing generated artifacts also lets the freshness check tolerate
+        # the small mtime skew seen on remote overlay filesystems safely.
+        json_path.unlink(missing_ok=True)
+        json_path.with_suffix(".html").unlink(missing_ok=True)
         command = [
             sys.executable,
             str(PROJECT_ROOT / "batch_instrument_report.py"),
@@ -135,6 +145,7 @@ def _run_batch(
             expected_profile=profile_name,
             expected_images=expected_images,
             started_ns=started_ns,
+            freshness_mtime_skew_ns=FRESHNESS_MTIME_SKEW_NS,
         )
         if completed.returncode == -signal.SIGABRT:
             warning = {
@@ -178,12 +189,15 @@ def load_completed_report(
     expected_profile: str,
     expected_images: list[str],
     started_ns: int,
+    freshness_mtime_skew_ns: int = 0,
 ) -> dict[str, Any]:
     """Load only artifacts freshly and completely written by the current command."""
 
     if not json_path.is_file() or not html_path.is_file():
         raise ValueError("Batch report artifacts are incomplete")
-    if min(json_path.stat().st_mtime_ns, html_path.stat().st_mtime_ns) < started_ns:
+    if min(json_path.stat().st_mtime_ns, html_path.stat().st_mtime_ns) < (
+        started_ns - freshness_mtime_skew_ns
+    ):
         raise ValueError("Batch report artifacts were not freshly generated")
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     profile_name = (payload.get("pipeline_profile") or {}).get("name")

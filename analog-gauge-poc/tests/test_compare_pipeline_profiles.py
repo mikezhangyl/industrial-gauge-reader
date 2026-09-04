@@ -38,6 +38,40 @@ class ComparePipelineProfilesTests(unittest.TestCase):
 
             self.assertEqual(payload["pipeline_profile"]["name"], "640")
 
+    def test_accepts_fresh_report_with_small_filesystem_mtime_skew(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            json_path = root / "instrument-report.json"
+            html_path = root / "instrument-report.html"
+            json_path.write_text(
+                json.dumps(
+                    {
+                        "pipeline_profile": {"name": "640"},
+                        "input_contract": {"image_order": ["meter.jpg"]},
+                        "records": [{"image": "meter.jpg"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            html_path.write_text(
+                "<!doctype html><html><title>report</title></html>", encoding="utf-8"
+            )
+
+            payload = load_completed_report(
+                json_path,
+                html_path,
+                expected_profile="640",
+                expected_images=["meter.jpg"],
+                started_ns=max(
+                    json_path.stat().st_mtime_ns,
+                    html_path.stat().st_mtime_ns,
+                )
+                + 500_000,
+                freshness_mtime_skew_ns=1_000_000,
+            )
+
+            self.assertEqual(payload["pipeline_profile"]["name"], "640")
+
     def test_rejects_a_stale_or_wrong_profile_report(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
