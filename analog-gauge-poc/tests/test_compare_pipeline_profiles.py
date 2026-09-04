@@ -97,7 +97,9 @@ class ComparePipelineProfilesTests(unittest.TestCase):
                     html_path,
                     expected_profile="640",
                     expected_images=["meter.jpg"],
-                    started_ns=time.time_ns() + 1_000_000,
+                    # Keep this well beyond the small filesystem-skew
+                    # tolerance used for freshly written artifacts.
+                    started_ns=time.time_ns() + 10_000_000,
                 )
 
 
