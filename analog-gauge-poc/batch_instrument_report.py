@@ -31,6 +31,11 @@ from src.batch_io import (
     preview_crop_bbox,
     processing_stage_thumbnail_data_uri,
 )
+from src.inference_device import (
+    DEVICE_CHOICES,
+    accelerator_fingerprint,
+    ensure_device_available,
+)
 from src.instrument_image import (
     GENERATED_VISUALIZATION_FAILURE,
     POINTER_DISPLAY_TYPES,
@@ -64,7 +69,7 @@ def main() -> int:
         type=Path,
         help="One image directory, or an ordered list of image files",
     )
-    parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="cpu")
     parser.add_argument(
         "--pipeline-profile",
         choices=GAUGE_PIPELINE_PROFILE_NAMES,
@@ -100,6 +105,10 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    try:
+        ensure_device_available(args.device)
+    except (RuntimeError, ValueError) as error:
+        parser.error(str(error))
     try:
         image_paths, input_directory = discover_input_images(args.inputs)
     except ValueError as error:
@@ -224,7 +233,7 @@ def main() -> int:
                     "at that stage; HTML thumbnails use object-fit contain."
                 ),
             },
-            "runtime": runtime_fingerprint(models),
+            "runtime": runtime_fingerprint(models, args.device),
             "separation_rule": (
                 "Automated results remain independent; user-confirmed values own the "
                 "final reviewed value and never become model input."
@@ -437,13 +446,16 @@ def _concentric_outer_label_bbox(
     )
 
 
-def runtime_fingerprint(models: dict[str, Path]) -> dict[str, Any]:
+def runtime_fingerprint(
+    models: dict[str, Path], selected_device: str = "cpu"
+) -> dict[str, Any]:
     """Record enough runtime identity to compare two machines."""
     packages = {}
     for package in (
         "numpy",
         "opencv-python",
         "onnxruntime",
+        "onnxruntime-gpu",
         "rapidocr",
         "torch",
         "torchvision",
@@ -488,6 +500,7 @@ def runtime_fingerprint(models: dict[str, Path]) -> dict[str, Any]:
         "platform": platform.platform(),
         "machine": platform.machine(),
         "packages": packages,
+        "accelerator": accelerator_fingerprint(selected_device),
         "models": {
             name: {
                 "filename": path.name,

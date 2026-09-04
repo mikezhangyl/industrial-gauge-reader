@@ -19,6 +19,7 @@ from typing import Any
 from PIL import Image, ImageOps
 
 from src.batch_io import discover_input_images
+from src.inference_device import DEVICE_CHOICES, ensure_device_available
 from src.pipeline_profile import GAUGE_PIPELINE_PROFILE_NAMES
 from src.profile_comparison import compare_profile_payloads
 
@@ -31,7 +32,7 @@ def main() -> int:
         description="Run a full automated comparison of two gauge profiles"
     )
     parser.add_argument("inputs", nargs="+", type=Path, help="Input image directories")
-    parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="cpu")
     parser.add_argument(
         "--profiles",
         nargs=2,
@@ -55,6 +56,10 @@ def main() -> int:
         help="Pass lossless processing-stage export through to each batch run",
     )
     args = parser.parse_args()
+    try:
+        ensure_device_available(args.device)
+    except (RuntimeError, ValueError) as error:
+        parser.error(str(error))
     input_directories = [path.resolve() for path in args.inputs]
     for path in input_directories:
         if not path.is_dir():

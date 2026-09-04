@@ -1,4 +1,4 @@
-# Analog Gauge Reading PoC (Apple Silicon)
+# Analog Gauge Reading PoC
 
 不训练、不微调，以整张图片为输入，自动检测表盘、定位指针、理解线性刻度并输出实际读数。
 
@@ -157,6 +157,8 @@ uv pip install -r requirements.txt
 python benchmark.py input/gauge.jpg
 ```
 
+Ubuntu NVIDIA A10/CUDA 环境使用专用分支和运行手册：[`docs/cuda-a10-runbook.md`](docs/cuda-a10-runbook.md)。该路径当前只将 YOLO 推理交给 CUDA，OCR 和 OpenCV 仍使用 CPU。
+
 默认行为：
 
 - MPS 可用时依次测试 CPU 和 MPS。
@@ -170,6 +172,7 @@ python benchmark.py input/gauge.jpg
 ```bash
 python benchmark.py input/gauge.jpg --device cpu
 python benchmark.py input/gauge.jpg --device mps
+python benchmark.py input/gauge.jpg --device cuda
 ```
 
 生成 `input/gauge*` 全量回归 HTML 报告：
@@ -203,7 +206,7 @@ T_steady = T_preprocess + T_inference + T_postprocess
 - preprocess：每次从完整图片路径解码。
 - inference：表盘检测、指针分割、椭圆校正，以及需要时的 PP-OCRv6 批量识别；MPS 前后显式同步。
 - postprocess：OCR 刻度拟合，或红绿分段、零点和相对段值计算。
-- CPU 当前比 MPS 略快，因为 ONNX OCR 使用 CPU，MPS 仅承载两个 YOLO 模型。
+- CPU 与 MPS 的本机对比中 CPU 曾略快，因为 ONNX OCR 使用 CPU，MPS 仅承载两个 YOLO 模型。CUDA 性能以 Ubuntu A10 实机报告为准。
 
 ## 验证
 

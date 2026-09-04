@@ -12,6 +12,8 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+from src.inference_device import synchronize
+
 MODEL_IMAGE_SIZE = 640
 
 
@@ -62,11 +64,6 @@ class GaugeResult:
     @property
     def level3(self) -> bool:
         return self.reading is not None
-
-
-def synchronize(device: str) -> None:
-    if device == "mps" and torch.backends.mps.is_available():
-        torch.mps.synchronize()
 
 
 def angle_from_points(

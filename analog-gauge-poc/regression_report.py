@@ -19,8 +19,9 @@ import cv2
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from benchmark import Metrics, available_devices, summary
+from benchmark import Metrics, summary
 from src.gauge_reader import GaugeResult, StageTimings
+from src.inference_device import ALL_DEVICE_CHOICES, available_devices
 from src.instrument_metadata import InstrumentMetadataCatalog
 from src.instrument_reading import InstrumentReadingInterpreter
 from src.model_store import ensure_models
@@ -407,7 +408,7 @@ def load_existing_results(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("images", nargs="*", type=Path)
-    parser.add_argument("--device", choices=("all", "cpu", "mps"), default="all")
+    parser.add_argument("--device", choices=ALL_DEVICE_CHOICES, default="all")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument(
@@ -439,9 +440,12 @@ def main() -> int:
     if not image_paths or any(not path.is_file() for path in image_paths):
         parser.error("Every input image must exist")
 
+    try:
+        devices = available_devices(args.device)
+    except (RuntimeError, ValueError) as error:
+        parser.error(str(error))
     models = ensure_models(PROJECT_ROOT / "models")
     reading_interpreter = InstrumentReadingInterpreter(InstrumentMetadataCatalog.load())
-    devices = available_devices(args.device)
     asset_dir = args.output.with_name(f"{args.output.stem}-assets")
     asset_dir.mkdir(parents=True, exist_ok=True)
     records: list[RegressionRecord] = []

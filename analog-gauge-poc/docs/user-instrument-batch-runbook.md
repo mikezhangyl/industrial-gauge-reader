@@ -231,6 +231,8 @@ HTML 不展示置信度、observation、人工确认值、自动/人工比对、
 
 ## 跨机器复现检查
 
+Ubuntu NVIDIA GPU 的安装、CUDA 设备证据、CPU/CUDA 非回归和性能验收统一按 [`cuda-a10-runbook.md`](cuda-a10-runbook.md) 执行。该分支完成真实 GPU 验收前，不得宣称 CUDA 路径可用。
+
 另一台机器出现不同结果时，先比较以下字段，再修改算法：
 
 1. 两边输入文件的 `records[].image_sha256` 是否完全相同；

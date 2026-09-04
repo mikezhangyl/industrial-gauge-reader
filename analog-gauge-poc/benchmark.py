@@ -14,6 +14,7 @@ from typing import Protocol
 
 import numpy as np
 import torch
+from torch import version as torch_version
 
 from src.gauge_reader import (
     AnalogGaugeReader,
@@ -21,6 +22,7 @@ from src.gauge_reader import (
     annotate,
     format_reading_value,
 )
+from src.inference_device import ALL_DEVICE_CHOICES, available_devices
 from src.instrument_metadata import InstrumentMetadataCatalog
 from src.instrument_reading import InstrumentReadingInterpreter
 from src.model_store import ensure_models
@@ -59,20 +61,6 @@ def summary(values: list[float]) -> dict[str, float]:
         "min": min(values),
         "max": max(values),
     }
-
-
-def available_devices(selection: str) -> list[str]:
-    mps_available = torch.backends.mps.is_built() and torch.backends.mps.is_available()
-    if selection == "cpu":
-        return ["cpu"]
-    if selection == "mps":
-        if not mps_available:
-            raise RuntimeError("MPS was requested but is not available")
-        return ["mps"]
-    devices = ["cpu"]
-    if mps_available:
-        devices.append("mps")
-    return devices
 
 
 def print_result(result: GaugeResult) -> None:
@@ -163,7 +151,7 @@ def print_benchmark(record: BenchmarkRecord) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("image", type=Path, help="Full input image; no ROI is accepted")
-    parser.add_argument("--device", choices=("all", "cpu", "mps"), default="all")
+    parser.add_argument("--device", choices=ALL_DEVICE_CHOICES, default="all")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument(
@@ -180,6 +168,10 @@ def main() -> int:
         parser.error(f"Input image does not exist: {args.image}")
     if args.units_per_major_segment <= 0:
         parser.error("--units-per-major-segment must be positive")
+    try:
+        devices = available_devices(args.device)
+    except (RuntimeError, ValueError) as error:
+        parser.error(str(error))
     warmups = max(5, args.warmup)
     runs = max(20, args.runs)
 
@@ -188,6 +180,12 @@ def main() -> int:
     print(f"PyTorch: {torch.__version__}")
     print(f"MPS built: {torch.backends.mps.is_built()}")
     print(f"MPS available: {torch.backends.mps.is_available()}")
+    print(f"PyTorch CUDA build: {torch_version.cuda or 'none'}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        for index in range(torch.cuda.device_count()):
+            print(f"CUDA device {index}: {torch.cuda.get_device_name(index)}")
     print(f"Warm-up runs: {warmups}")
     print(f"Measured runs: {runs}")
     print(f"Units per colored major segment: {args.units_per_major_segment:g}")
@@ -219,7 +217,7 @@ def main() -> int:
 
     records: list[BenchmarkRecord] = []
     for model_name, factory in candidates:
-        for device in available_devices(args.device):
+        for device in devices:
             print(f"\n=== {model_name} / {device.upper()} ===")
             result, metrics, model_load_ms, reader = benchmark_reader(
                 args.image, factory, device, warmups, runs
