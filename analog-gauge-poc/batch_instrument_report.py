@@ -8,7 +8,9 @@ import hashlib
 import html
 import importlib.metadata
 import json
+import os
 import platform
+import re
 import subprocess
 import sys
 from dataclasses import asdict
@@ -16,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+
+import cv2
 
 from src.batch_io import (
     NORMALIZED_MAX_EDGE,
@@ -25,6 +29,7 @@ from src.batch_io import (
     discover_input_images,
     normalize_batch_images,
     preview_crop_bbox,
+    processing_stage_thumbnail_data_uri,
 )
 from src.instrument_image import (
     GENERATED_VISUALIZATION_FAILURE,
@@ -38,6 +43,12 @@ from src.instrument_observations import (
 )
 from src.instrument_reading import InstrumentReadingInterpreter
 from src.model_store import ensure_models
+from src.pipeline_profile import (
+    DEFAULT_GAUGE_PIPELINE_PROFILE_NAME,
+    GAUGE_PIPELINE_PROFILE_NAMES,
+    get_gauge_pipeline_profile,
+)
+from src.processing_stages import ProcessingStageWriter
 from src.rapidocr_reader import EthzPaddleGaugeReader
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -55,6 +66,15 @@ def main() -> int:
     )
     parser.add_argument("--device", choices=("cpu", "mps"), default="cpu")
     parser.add_argument(
+        "--pipeline-profile",
+        choices=GAUGE_PIPELINE_PROFILE_NAMES,
+        default=DEFAULT_GAUGE_PIPELINE_PROFILE_NAME,
+        help=(
+            "Gauge-processing profile; 448-highres-pad is the audited default "
+            "and 448 remains the comparison baseline"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -71,6 +91,14 @@ def main() -> int:
             "locally confirmed pointer channel matches the automated result"
         ),
     )
+    parser.add_argument(
+        "--export-processing-stages",
+        action="store_true",
+        help=(
+            "Write lossless images for each selected processing stage beside the "
+            "report and include a review gallery in HTML/JSON"
+        ),
+    )
     args = parser.parse_args()
     try:
         image_paths, input_directory = discover_input_images(args.inputs)
@@ -81,33 +109,91 @@ def main() -> int:
     metadata_catalog = InstrumentMetadataCatalog.load()
     observation_catalog = InstrumentObservationCatalog.load(metadata_catalog)
     models = ensure_models(PROJECT_ROOT / "models")
+    pipeline_profile = get_gauge_pipeline_profile(args.pipeline_profile)
     reader = EthzPaddleGaugeReader(
         models["ethz-gauge-detection.pt"],
         models["ethz-segmentation.pt"],
         args.device,
         reading_interpreter=InstrumentReadingInterpreter(metadata_catalog),
+        profile=pipeline_profile,
     )
     analyzer = MetadataAwareImageAnalyzer(reader, metadata_catalog)
+    generated_at = datetime.now().astimezone()
+    stage_run_id = generated_at.strftime("%Y%m%dT%H%M%S%f%z")
+    stage_root = Path("processing-stages") / stage_run_id
     with TemporaryDirectory(prefix="instrument-batch-normalized-") as temp_dir:
         normalized_images = normalize_batch_images(
             image_paths,
             Path(temp_dir),
             max_edge=NORMALIZED_MAX_EDGE,
+            preserve_full_resolution_detail=(
+                pipeline_profile.use_high_resolution_detail
+            ),
         )
-        records = [
-            evaluate_image(
-                batch_image,
-                analyzer,
-                metadata_catalog,
-                observation_catalog,
+        records = []
+        for index, batch_image in enumerate(normalized_images, start=1):
+            stage_writer = None
+            if args.export_processing_stages:
+                image_key = _safe_stage_image_key(index, batch_image.source_path.stem)
+                stage_writer = ProcessingStageWriter(
+                    output_path.parent,
+                    stage_root / image_key,
+                )
+                stage_writer.write_oriented_source(batch_image.source_path)
+                analysis_image = cv2.imread(
+                    str(batch_image.analysis_path), cv2.IMREAD_COLOR
+                )
+                if analysis_image is None:
+                    raise FileNotFoundError(
+                        f"Cannot decode normalized image: {batch_image.analysis_path}"
+                    )
+                stage_writer.write(
+                    "batch-input",
+                    "analysis-image",
+                    analysis_image,
+                    title_zh="低分辨率定位/分析图",
+                    operation=f"proportional_max_edge_{NORMALIZED_MAX_EDGE}",
+                    source_stage="oriented-source",
+                    preserves_aspect_ratio=True,
+                    note_zh="最长边受限，等比例缩放；这是表盘定位使用的整图。",
+                )
+                if (
+                    pipeline_profile.use_high_resolution_detail
+                    and batch_image.detail_path is not None
+                    and batch_image.detail_path != batch_image.analysis_path
+                ):
+                    detail_image = cv2.imread(
+                        str(batch_image.detail_path), cv2.IMREAD_COLOR
+                    )
+                    if detail_image is None:
+                        raise FileNotFoundError(
+                            f"Cannot decode detail image: {batch_image.detail_path}"
+                        )
+                    stage_writer.write(
+                        "batch-input",
+                        "detail-image",
+                        detail_image,
+                        title_zh="高分辨率细节图",
+                        operation="identity_oriented_full_resolution",
+                        source_stage="oriented-source",
+                        preserves_aspect_ratio=True,
+                        note_zh="只供高分辨率实验 profile 的几何/OCR 阶段使用。",
+                    )
+            records.append(
+                evaluate_image(
+                    batch_image,
+                    analyzer,
+                    metadata_catalog,
+                    observation_catalog,
+                    stage_writer=stage_writer,
+                )
             )
-            for batch_image in normalized_images
-        ]
         pointer_acceptance = summarize_pointer_acceptance(records, metadata_catalog)
         automated_summary = summarize_automated(records)
         payload = {
-            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "generated_at": generated_at.isoformat(timespec="seconds"),
             "device": args.device,
+            "pipeline_profile": asdict(pipeline_profile),
             "input_contract": {
                 "mode": "directory" if input_directory is not None else "files",
                 "batch_name": input_directory.name
@@ -119,7 +205,24 @@ def main() -> int:
                     "color_mode": "RGB",
                     "maximum_edge_pixels": NORMALIZED_MAX_EDGE,
                     "analysis_format": "PNG",
+                    "detail_source": (
+                        "oriented_full_resolution"
+                        if pipeline_profile.use_high_resolution_detail
+                        else "analysis_image"
+                    ),
                 },
+                "processing_stage_export": args.export_processing_stages,
+            },
+            "processing_stages": {
+                "enabled": args.export_processing_stages,
+                "root": stage_root.as_posix()
+                if args.export_processing_stages
+                else None,
+                "format": "lossless PNG",
+                "geometry_rule": (
+                    "Every sidecar file keeps the exact pixel dimensions produced "
+                    "at that stage; HTML thumbnails use object-fit contain."
+                ),
             },
             "runtime": runtime_fingerprint(models),
             "separation_rule": (
@@ -137,7 +240,14 @@ def main() -> int:
             encoding="utf-8",
         )
         html_path = output_path.with_suffix(".html")
-        html_path.write_text(render_html(payload, normalized_images), encoding="utf-8")
+        html_path.write_text(
+            render_html(
+                payload,
+                normalized_images,
+                report_directory=output_path.parent,
+            ),
+            encoding="utf-8",
+        )
     reader.close()
     del analyzer
     del reader
@@ -147,6 +257,8 @@ def main() -> int:
         print(f"Input directory: {input_directory.resolve()}")
     print(f"JSON: {output_path.resolve()}")
     print(f"HTML: {html_path.resolve()}")
+    if args.export_processing_stages:
+        print(f"Processing stages: {(output_path.parent / stage_root).resolve()}")
     rejected_visualizations = [
         record["image"]
         for record in records
@@ -179,8 +291,14 @@ def evaluate_image(
     analyzer: MetadataAwareImageAnalyzer,
     metadata_catalog: InstrumentMetadataCatalog,
     observation_catalog: InstrumentObservationCatalog,
+    *,
+    stage_writer: ProcessingStageWriter | None = None,
 ) -> dict[str, Any]:
-    analysis = analyzer.analyze(batch_image.analysis_path)
+    analysis = analyzer.analyze(
+        batch_image.analysis_path,
+        detail_image_path=batch_image.detail_path,
+        stage_writer=stage_writer,
+    )
     observation = observation_catalog.for_image(batch_image.source_path)
     automated_by_key = {
         (channel.instance_id, channel.channel_id): channel
@@ -229,6 +347,9 @@ def evaluate_image(
         "source_dimensions": list(batch_image.source_size),
         "oriented_dimensions": list(batch_image.oriented_size),
         "analysis_dimensions": list(batch_image.normalized_size),
+        "detail_dimensions": list(
+            batch_image.detail_size or batch_image.normalized_size
+        ),
         "instrument_type_id": analysis.instrument_type_id,
         "expected_instrument_type_id": (
             observation.instrument_type_id if observation is not None else None
@@ -245,7 +366,13 @@ def evaluate_image(
             preview_crop_bbox(detections, batch_image.normalized_size)
         ),
         "channels": channel_records,
+        "processing_stages": stage_writer.records() if stage_writer else [],
     }
+
+
+def _safe_stage_image_key(index: int, stem: str) -> str:
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-.") or "image"
+    return f"{index:02d}-{safe_stem}"
 
 
 def _serialize_detections(
@@ -528,6 +655,8 @@ def summarize_pointer_acceptance(
 def render_html(
     payload: dict[str, Any],
     normalized_images: list[NormalizedBatchImage] | None = None,
+    *,
+    report_directory: Path | None = None,
 ) -> str:
     summary = payload.get("automated_summary") or summarize_automated(
         payload["records"]
@@ -596,6 +725,7 @@ def render_html(
             if failure_reason
             else ""
         )
+        stage_markup = _render_processing_stage_gallery(record, report_directory)
         cards.append(
             '<section class="report-card">'
             '<div class="image-panel">'
@@ -612,6 +742,7 @@ def render_html(
             "<th>实例</th><th>通道</th><th>程序识别结果</th><th>状态</th>"
             f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
             "</div>"
+            f"{stage_markup}"
             "</section>"
         )
     return f"""<!doctype html>
@@ -639,6 +770,15 @@ th,td{{border:1px solid #d8ded9;padding:9px;text-align:left;vertical-align:top;o
 th{{background:#eef3ef}} .status{{display:inline-block;padding:2px 7px;border-radius:999px;font-size:12px}}
 .channel-detail td{{padding:7px 9px 12px;background:#fafbfa;color:#506057;font-size:12px}}
 .channel-detail span{{display:inline-block;margin-right:18px}}
+.processing-stages{{grid-column:1/-1;border-top:1px solid #d8ded9;padding-top:14px}}
+.processing-stages summary{{cursor:pointer;font-weight:650;color:#254b38}}
+.stage-note{{font-size:12px;color:#65736b;line-height:1.5}}
+.stage-group{{margin:18px 0 8px;font-size:15px}}
+.stage-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}}
+.stage-card{{border:1px solid #d8ded9;border-radius:9px;padding:10px;background:#fafbfa}}
+.stage-card img{{display:block;width:100%;height:180px;object-fit:contain;background:#eef1ee;border-radius:6px}}
+.stage-card h4{{margin:9px 0 4px;font-size:14px}}
+.stage-card p{{margin:3px 0;font-size:11px;color:#59675f;overflow-wrap:anywhere}}
 .status-recognized .status{{background:#dff2e5;color:#17612d}}
 .status-ambiguous .status{{background:#fff0d8;color:#80520c}}
 .status-not_recognized .status{{background:#fde2df;color:#902d25}}
@@ -653,6 +793,75 @@ th{{background:#eef3ef}} .status{{display:inline-block;padding:2px 7px;border-ra
 <div class="{"failure" if summary["not_recognized"] else ""}">未识别 {summary["not_recognized"]}</div>
 <div class="{"failure" if summary["analysis_failures"] else ""}">图片级失败 {summary["analysis_failures"]}</div></div>
 {"".join(cards)}</main></body></html>"""
+
+
+def _render_processing_stage_gallery(
+    record: dict[str, Any], report_directory: Path | None
+) -> str:
+    stages = record.get("processing_stages") or []
+    if not stages:
+        return ""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for stage in stages:
+        grouped.setdefault(str(stage.get("group") or "stage"), []).append(stage)
+    groups: list[str] = []
+    for group_name, group_stages in grouped.items():
+        cards: list[str] = []
+        for stage in group_stages:
+            relative_path = Path(str(stage.get("path") or ""))
+            stage_path = (
+                report_directory / relative_path
+                if report_directory is not None and not relative_path.is_absolute()
+                else relative_path
+            )
+            thumbnail = (
+                processing_stage_thumbnail_data_uri(stage_path)
+                if stage_path.is_file()
+                else None
+            )
+            image_markup = (
+                f'<a href="{html.escape(relative_path.as_posix())}" target="_blank">'
+                f'<img src="{thumbnail}" alt="{html.escape(str(stage.get("title_zh") or stage.get("stage_id") or "stage"))}"></a>'
+                if thumbnail is not None
+                else '<div class="image-missing">阶段图文件缺失</div>'
+            )
+            dimensions = stage.get("dimensions") or []
+            aspect_ratio = stage.get("aspect_ratio")
+            geometry = (
+                f"{dimensions[0]}×{dimensions[1]} · 宽高比 {float(aspect_ratio):.6f}"
+                if len(dimensions) == 2 and aspect_ratio is not None
+                else "尺寸未知"
+            )
+            aspect_flag = stage.get("preserves_aspect_ratio")
+            aspect_text = (
+                "保持宽高比"
+                if aspect_flag is True
+                else "改变宽高比"
+                if aspect_flag is False
+                else "宽高比不适用"
+            )
+            note = str(stage.get("note_zh") or "")
+            cards.append(
+                '<article class="stage-card">'
+                f"{image_markup}"
+                f"<h4>{html.escape(str(stage.get('title_zh') or stage.get('stage_id') or 'stage'))}</h4>"
+                f"<p>{html.escape(geometry)} · {html.escape(aspect_text)}</p>"
+                f"<p>操作：<code>{html.escape(str(stage.get('operation') or '—'))}</code></p>"
+                f"<p>{html.escape(note)}</p>"
+                f'<p><a href="{html.escape(relative_path.as_posix())}" target="_blank">打开原尺寸 PNG</a></p>'
+                "</article>"
+            )
+        groups.append(
+            f'<h3 class="stage-group">{html.escape(group_name)}</h3>'
+            f'<div class="stage-grid">{"".join(cards)}</div>'
+        )
+    return (
+        '<details class="processing-stages">'
+        f"<summary>处理阶段审阅（{len(stages)} 张原尺寸 PNG）</summary>"
+        '<p class="stage-note">缩略图仅等比例缩小并完整显示，不裁剪、不拉伸；'
+        "每张图下方标注真实像素尺寸和宽高比，点击可打开输出目录中的原尺寸文件。</p>"
+        f"{''.join(groups)}</details>"
+    )
 
 
 def _automated_status_label(status: str) -> str:
@@ -686,4 +895,12 @@ def _format_value(value: Any, candidates: list[float], unit: str | None) -> str:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if sys.platform == "darwin":
+        # RapidOCR's ONNX Runtime may abort while destroying already-closed
+        # sessions during interpreter teardown.  All reports and streams are
+        # finalized above; bypass only that unsafe native destructor phase.
+        os._exit(exit_code)
+    raise SystemExit(exit_code)

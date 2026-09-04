@@ -40,6 +40,20 @@ class ColorScaleReaderTests(unittest.TestCase):
 
         self.assertLess(result.reading, 0)
 
+    def test_finds_colored_segments_on_an_inner_radius(self):
+        dial = np.full((640, 640, 3), 230, dtype=np.uint8)
+        center = (320, 320)
+        axes = (190, 190)
+        cv2.ellipse(dial, center, axes, 0, 120, 147, (0, 0, 210), 25)
+        cv2.ellipse(dial, center, axes, 0, 155, 178, (40, 190, 50), 25)
+        cv2.ellipse(dial, center, axes, 0, 186, 213, (40, 190, 50), 25)
+        cv2.ellipse(dial, center, axes, 0, 221, 248, (40, 190, 50), 25)
+
+        result = read_color_segments(dial, self.direction(181), 1.0)
+
+        self.assertEqual(result.green_segments, 3)
+        self.assertAlmostEqual(result.reading, 0.90, delta=0.12)
+
 
 if __name__ == "__main__":
     unittest.main()

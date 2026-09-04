@@ -24,6 +24,13 @@ class InstrumentMetadataTests(unittest.TestCase):
 
         self.assertEqual([item.type_id for item in matches], ["surge_arrester_monitor"])
 
+    def test_arrester_scale_text_does_not_match_generic_dual_scale_meter(self):
+        matches = self.catalog.find(
+            "005 标称动作电流 10kA 800A 0.2 0.4 0.6 0.8 mA"
+        )
+
+        self.assertEqual([item.type_id for item in matches], ["surge_arrester_monitor"])
+
     def test_loads_one_metadata_bundle_per_instrument_type(self):
         self.assertEqual(
             {item.type_id for item in self.catalog.instrument_types},
@@ -33,6 +40,10 @@ class InstrumentMetadataTests(unittest.TestCase):
                 "transformer_pointer_oil_level_indicator",
                 "shm_d_motor_drive_unit",
                 "arrester_discharge_counter",
+                "rectangular_panel_voltmeter",
+                "dual_scale_rectangular_panel_meter",
+                "round_0_10_oil_level_indicator",
+                "yzf2_140th_oil_level_indicator",
             },
         )
 
@@ -52,6 +63,17 @@ class InstrumentMetadataTests(unittest.TestCase):
             "".join(metadata.interpretation_rules_zh),
         )
 
+    def test_arrester_monitor_records_zero_adjustment_screw_geometry(self):
+        metadata = self.catalog.get("surge_arrester_monitor")
+        rules = "".join(metadata.interpretation_rules_zh)
+
+        self.assertIn("调零螺钉", rules)
+        self.assertIn("不是指针轴心", rules)
+        self.assertIn("指针延长线", rules)
+        self.assertIn("最右端刻度", rules)
+        self.assertIn("中间刻度", rules)
+        self.assertIn("斜拍", rules)
+
     def test_resolves_dual_scale_synchronous_voltmeter(self):
         metadata = self.catalog.find("D96-V 同期电压表")[0]
         scales = metadata.channel("synchronizing_voltage").scales
@@ -63,7 +85,7 @@ class InstrumentMetadataTests(unittest.TestCase):
         )
         self.assertEqual(
             metadata.channel("synchronizing_voltage").dial_arc.start_angle_degrees,
-            268.0,
+            270.0,
         )
 
     def test_oil_level_indicator_distinguishes_pointer_from_counterweight(self):
@@ -87,6 +109,36 @@ class InstrumentMetadataTests(unittest.TestCase):
             [item.type_id for item in matches],
             ["transformer_pointer_oil_level_indicator"],
         )
+
+    def test_keoi_max_is_enough_when_min_is_lost_to_glare(self):
+        matches = self.catalog.find("Shandong Taikai KEOI MAX 油位计 OIL-LEV")
+
+        self.assertEqual(
+            [item.type_id for item in matches],
+            ["transformer_pointer_oil_level_indicator"],
+        )
+
+    def test_specific_oil_level_model_wins_over_broad_family_text(self):
+        matches = self.catalog.find(
+            "MAX 10 油位计 OIL LEVEL INDICATOR YZF2-140TH MIN"
+        )
+
+        self.assertEqual(
+            [item.type_id for item in matches],
+            ["yzf2_140th_oil_level_indicator"],
+        )
+
+    def test_common_round_oil_level_scale_matches_without_a_model_number(self):
+        matches = self.catalog.find("油位 8 9 10 5 4 3 2 1 0")
+
+        self.assertEqual(
+            [item.type_id for item in matches],
+            ["round_0_10_oil_level_indicator"],
+        )
+
+        channel = matches[0].channel("relative_oil_level")
+        self.assertEqual(channel.dial_arc.start_angle_degrees, 130.0)
+        self.assertEqual(channel.dial_arc.end_angle_degrees, 45.0)
 
     def test_shm_d_separates_position_status_and_operation_count(self):
         metadata = self.catalog.find("SHM-D Motor drive unit")[0]

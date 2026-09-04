@@ -1,17 +1,69 @@
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
+from src.gauge_reader import angle_from_points
 from src.rapidocr_reader import (
+    DialCandidate,
+    PointerSegmentationTrace,
     adaptive_tile_levels,
+    detect_dial_ellipse,
+    detect_rectangular_gauge_candidates,
+    detect_visible_pointer_hub,
+    ellipse_fits_crop,
+    expand_candidate_and_pointer_mask,
     is_plausible_dial_bbox,
     is_unclipped_tile_candidate,
+    map_bbox_between_images,
+    measure_dial_ellipse_quality,
+    measure_projectively_concentric_ring_support,
+    pad_dial_crop_to_square,
     pointer_center_and_tip,
+    pointer_from_rectified_mask,
+    projective_ellipse_rectification,
+    refine_dial_ellipse_from_concentric_rings,
+    refine_dial_ellipse_from_pose_prior,
+    select_consensus_dial_ellipse,
+    select_hub_consistent_ellipse_center,
+    select_pointer_segmentation_trace,
 )
 
 
 class AdaptiveDetectionTests(unittest.TestCase):
+    @staticmethod
+    def _trace(
+        bbox: tuple[int, int, int, int],
+        global_center: tuple[int, int],
+        pointer_confidence: float,
+        detection_confidence: float,
+    ) -> PointerSegmentationTrace:
+        x1, y1, x2, y2 = bbox
+        width, height = x2 - x1, y2 - y1
+        local_center = (global_center[0] - x1, global_center[1] - y1)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.line(
+            mask,
+            local_center,
+            (max(0, local_center[0] - 100), max(0, local_center[1] - 100)),
+            1,
+            8,
+        )
+        cv2.circle(mask, local_center, 18, 1, -1)
+        crop = np.zeros((height, width, 3), dtype=np.uint8)
+        return PointerSegmentationTrace(
+            candidate=DialCandidate(bbox, detection_confidence),
+            mask=mask,
+            confidence=pointer_confidence,
+            method="test",
+            crop=crop,
+            canvas=crop,
+            model_input=None,
+            model_output_mask=None,
+            content_bbox=(0, 0, width, height),
+        )
+
     def test_full_panorama_is_not_a_plausible_dial_box(self):
         self.assertFalse(
             is_plausible_dial_bbox((0, 0, 2400, 600), (600, 2400))
@@ -58,6 +110,394 @@ class AdaptiveDetectionTests(unittest.TestCase):
                 (800, 100, 1400, 500), (600, 0, 1800, 600), image_shape
             )
         )
+
+    def test_detection_bbox_maps_back_to_high_resolution_source(self):
+        mapped = map_bbox_between_images(
+            (100, 50, 500, 450),
+            source_shape=(800, 1000),
+            target_shape=(2400, 3000),
+        )
+
+        self.assertEqual(mapped, (300, 150, 1500, 1350))
+
+    def test_non_square_dial_crop_is_padded_without_stretching(self):
+        crop = np.zeros((200, 400, 3), dtype=np.uint8)
+
+        padded, content_bbox = pad_dial_crop_to_square(crop)
+
+        self.assertEqual(padded.shape, (400, 400, 3))
+        self.assertEqual(content_bbox, (0, 100, 400, 300))
+
+    def test_geometry_crop_expansion_keeps_pointer_at_original_coordinates(self):
+        mask = np.ones((100, 200), dtype=np.uint8)
+        candidate = DialCandidate((100, 50, 300, 150), 0.9)
+
+        expanded, expanded_mask = expand_candidate_and_pointer_mask(
+            candidate,
+            mask,
+            image_shape=(400, 500),
+            margin_fraction=0.10,
+        )
+
+        self.assertEqual(expanded.bbox, (80, 40, 320, 160))
+        self.assertEqual(expanded_mask.shape, (120, 240))
+        self.assertEqual(int(expanded_mask[10:110, 20:220].sum()), 20_000)
+        self.assertEqual(int(expanded_mask.sum()), 20_000)
+
+    def test_ellipse_outside_crop_is_not_accepted_for_rectification(self):
+        self.assertFalse(
+            ellipse_fits_crop(
+                ((20.0, 100.0), (180.0, 220.0), 0.0),
+                (200, 200),
+                tolerance_fraction=0.03,
+            )
+        )
+
+    def test_large_dark_rectangular_meter_frames_are_detected(self):
+        image = np.full((500, 900, 3), 220, dtype=np.uint8)
+        for x1 in (50, 325, 600):
+            cv2.rectangle(image, (x1, 120), (x1 + 220, 360), (20, 20, 20), 24)
+            cv2.rectangle(image, (x1 + 24, 144), (x1 + 196, 336), (245, 245, 245), -1)
+
+        candidates = detect_rectangular_gauge_candidates(image)
+
+        self.assertEqual(len(candidates), 3)
+
+    def test_scene_sized_frame_does_not_beat_local_dial_candidate(self):
+        scene_frame = self._trace(
+            (7, 0, 1440, 1487), (846, 848), 0.95, 0.66
+        )
+        complete_dial = self._trace(
+            (552, 547, 1110, 1184), (846, 848), 0.75, 0.60
+        )
+        incomplete_face = self._trace(
+            (660, 625, 1067, 1100), (826, 950), 0.67, 0.75
+        )
+
+        selected = select_pointer_segmentation_trace(
+            [scene_frame, complete_dial, incomplete_face],
+            image_shape=(1920, 1440),
+        )
+
+        self.assertEqual(selected.candidate.bbox, complete_dial.candidate.bbox)
+
+    def test_thick_counterweight_is_not_mistaken_for_pointer_tip(self):
+        mask = np.zeros((640, 640), dtype=np.uint8)
+        cv2.line(mask, (170, 470), (320, 320), 1, 8)
+        cv2.line(mask, (320, 320), (500, 130), 1, 24)
+
+        direction, _ = pointer_from_rectified_mask(mask)
+
+        self.assertAlmostEqual(
+            angle_from_points((0.0, 0.0), direction),
+            224.0,
+            delta=5.0,
+        )
+
+    def test_outer_rim_is_preferred_over_centered_inner_decoration(self):
+        image = np.full((400, 400, 3), 240, dtype=np.uint8)
+        cv2.circle(image, (190, 190), 170, (20, 20, 20), 2)
+        cv2.circle(image, (200, 200), 90, (20, 20, 20), 4)
+        pointer_mask = np.zeros((400, 400), dtype=np.uint8)
+        cv2.line(pointer_mask, (200, 200), (200, 50), 1, 8)
+        cv2.circle(pointer_mask, (200, 200), 18, 1, -1)
+
+        ellipse = detect_dial_ellipse(image, pointer_mask)
+
+        self.assertGreater(min(ellipse[1]), 300.0)
+
+    def test_broken_outer_rim_is_recovered_only_with_strong_edge_support(self):
+        image = np.full((500, 600, 3), 240, dtype=np.uint8)
+        for start_angle in range(0, 360, 12):
+            cv2.ellipse(
+                image,
+                (300, 255),
+                (245, 190),
+                12,
+                start_angle,
+                start_angle + 8,
+                (20, 20, 20),
+                4,
+            )
+        pointer_mask = np.zeros((500, 600), dtype=np.uint8)
+        cv2.line(pointer_mask, (300, 255), (170, 100), 1, 8)
+        cv2.circle(pointer_mask, (300, 255), 18, 1, -1)
+
+        ellipse = detect_dial_ellipse(image, pointer_mask)
+        edge_support, visible_arc = measure_dial_ellipse_quality(image, ellipse)
+
+        np.testing.assert_allclose(ellipse[0], [300.0, 255.0], atol=6.0)
+        np.testing.assert_allclose(sorted(ellipse[1]), [380.0, 490.0], atol=15.0)
+        self.assertGreaterEqual(edge_support, 0.80)
+        self.assertGreaterEqual(visible_arc, 0.50)
+
+    def test_pose_prior_refinement_does_not_jump_to_a_larger_distractor_ring(self):
+        image = np.full((500, 600, 3), 240, dtype=np.uint8)
+        true_rim = ((300, 250), (360, 430), 27)
+        cv2.ellipse(image, true_rim, (20, 20, 20), 4)
+        for start_angle in range(0, 360, 18):
+            cv2.ellipse(
+                image,
+                (286, 262),
+                (220, 265),
+                1,
+                start_angle,
+                start_angle + 13,
+                (20, 20, 20),
+                5,
+            )
+        pointer_mask = np.zeros((500, 600), dtype=np.uint8)
+        cv2.line(pointer_mask, (300, 250), (190, 105), 1, 8)
+        cv2.circle(pointer_mask, (300, 250), 18, 1, -1)
+        contour_pose_prior = ((314.0, 239.0), (382.0, 452.0), 25.0)
+
+        ellipse = refine_dial_ellipse_from_pose_prior(
+            image,
+            pointer_mask,
+            contour_pose_prior,
+        )
+
+        np.testing.assert_allclose(ellipse[0], true_rim[0], atol=8.0)
+        np.testing.assert_allclose(
+            sorted(ellipse[1]),
+            sorted(true_rim[1]),
+            atol=15.0,
+        )
+        angle_delta = abs((ellipse[2] - true_rim[2] + 90.0) % 180.0 - 90.0)
+        self.assertLessEqual(angle_delta, 6.0)
+
+    def test_shadow_arc_cannot_replace_a_projectively_concentric_ring_pair(self):
+        frontal = np.full((700, 700, 3), 235, dtype=np.uint8)
+        cv2.circle(frontal, (350, 350), 280, (20, 20, 20), 5)
+        cv2.circle(frontal, (350, 350), 225, (35, 35, 35), 5)
+        # A strong, displaced upper arc simulates the KEOI shadow boundary.
+        cv2.ellipse(
+            frontal,
+            (350, 315),
+            (245, 205),
+            0,
+            190,
+            350,
+            (15, 15, 15),
+            14,
+        )
+        cv2.circle(frontal, (350, 350), 20, (245, 245, 245), -1)
+        cv2.circle(frontal, (350, 350), 20, (35, 35, 35), 4)
+        pointer_mask = np.zeros((700, 700), dtype=np.uint8)
+        cv2.line(pointer_mask, (350, 350), (480, 145), 1, 12)
+        cv2.circle(pointer_mask, (350, 350), 20, 1, -1)
+
+        source = np.float32(((0, 0), (699, 0), (699, 699), (0, 699)))
+        destination = np.float32(((95, 45), (625, 5), (690, 675), (25, 610)))
+        perspective = cv2.getPerspectiveTransform(source, destination)
+        image = cv2.warpPerspective(frontal, perspective, (700, 700))
+        warped_mask = cv2.warpPerspective(
+            pointer_mask,
+            perspective,
+            (700, 700),
+            flags=cv2.INTER_NEAREST,
+        )
+        projected_outer = cv2.perspectiveTransform(
+            np.asarray(
+                cv2.ellipse2Poly((350, 350), (280, 280), 0, 0, 359, 2),
+                dtype=np.float32,
+            ).reshape(-1, 1, 2),
+            perspective,
+        )
+        true_outer = cv2.fitEllipse(projected_outer)
+        misleading_prior = (
+            (true_outer[0][0] + 18.0, true_outer[0][1] - 12.0),
+            (true_outer[1][0] * 0.86, true_outer[1][1] * 0.88),
+            true_outer[2] - 7.0,
+        )
+
+        ellipse = refine_dial_ellipse_from_concentric_rings(
+            image,
+            warped_mask,
+            misleading_prior,
+        )
+        outer_support, inner_support, inner_radius_fraction = (
+            measure_projectively_concentric_ring_support(
+                image,
+                ellipse,
+                pointer_center_and_tip(warped_mask)[0],
+            )
+        )
+
+        np.testing.assert_allclose(ellipse[0], true_outer[0], atol=25.0)
+        np.testing.assert_allclose(
+            sorted(ellipse[1]),
+            sorted(true_outer[1]),
+            atol=35.0,
+        )
+        self.assertGreaterEqual(outer_support, 0.30)
+        self.assertGreaterEqual(inner_support, 0.25)
+        self.assertGreaterEqual(inner_radius_fraction, 0.68)
+        self.assertLessEqual(inner_radius_fraction, 0.88)
+        transform = projective_ellipse_rectification(
+            ellipse,
+            pointer_center_and_tip(warped_mask)[0],
+        )
+        rectified_mask = cv2.warpPerspective(
+            warped_mask,
+            transform,
+            (640, 640),
+            flags=cv2.INTER_NEAREST,
+        )
+        direction, _ = pointer_from_rectified_mask(rectified_mask)
+        expected_angle = angle_from_points((350.0, 350.0), (480.0, 145.0))
+        actual_angle = angle_from_points((0.0, 0.0), direction)
+        angle_delta = abs((actual_angle - expected_angle + 180.0) % 360.0 - 180.0)
+        self.assertLessEqual(angle_delta, 4.0)
+
+    def test_bright_physical_hub_beats_nearby_dark_shadow_circle(self):
+        image = np.full((400, 400, 3), 210, dtype=np.uint8)
+        cv2.circle(image, (200, 200), 18, (245, 245, 245), -1)
+        cv2.circle(image, (200, 200), 18, (45, 45, 45), 3)
+        cv2.circle(image, (222, 222), 19, (55, 55, 55), -1)
+        cv2.circle(image, (222, 222), 19, (20, 20, 20), 3)
+        pointer_mask = np.zeros((400, 400), dtype=np.uint8)
+        cv2.line(pointer_mask, (200, 200), (310, 70), 1, 10)
+        cv2.circle(pointer_mask, (216, 216), 22, 1, -1)
+
+        center = detect_visible_pointer_hub(
+            image,
+            pointer_mask,
+            ((190.0, 190.0), (560.0, 600.0), 12.0),
+        )
+
+        np.testing.assert_allclose(center, (200.0, 200.0), atol=5.0)
+
+    def test_coherent_contour_is_kept_when_edge_search_has_no_better_rim(self):
+        image = np.full((400, 400, 3), 240, dtype=np.uint8)
+        cv2.circle(image, (200, 200), 170, (20, 20, 20), 3)
+        pointer_mask = np.zeros((400, 400), dtype=np.uint8)
+        cv2.line(pointer_mask, (200, 200), (100, 80), 1, 8)
+        cv2.circle(pointer_mask, (200, 200), 18, 1, -1)
+
+        with (
+            patch(
+                "src.rapidocr_reader.ellipse_edge_support",
+                return_value=(0.50, 1.0),
+            ),
+            patch(
+                "src.rapidocr_reader._search_edge_supported_dial_ellipse",
+                side_effect=ValueError("no stronger physical rim"),
+            ),
+        ):
+            ellipse = detect_dial_ellipse(image, pointer_mask)
+
+        np.testing.assert_allclose(ellipse[0], [200.0, 200.0], atol=5.0)
+        self.assertGreater(min(ellipse[1]), 330.0)
+
+    def test_low_resolution_dial_does_not_enable_projective_ring_search(self):
+        image = np.full((500, 500, 3), 240, dtype=np.uint8)
+        cv2.circle(image, (250, 250), 210, (20, 20, 20), 4)
+        pointer_mask = np.zeros((500, 500), dtype=np.uint8)
+        cv2.line(pointer_mask, (250, 250), (130, 100), 1, 8)
+        cv2.circle(pointer_mask, (250, 250), 18, 1, -1)
+        repaired = ((251.0, 250.0), (420.0, 420.0), 0.0)
+
+        with (
+            patch(
+                "src.rapidocr_reader.refine_dial_ellipse_center",
+                return_value=repaired,
+            ),
+            patch(
+                "src.rapidocr_reader.refine_dial_ellipse_from_concentric_rings",
+                side_effect=AssertionError("projective search must stay disabled"),
+            ),
+            patch(
+                "src.rapidocr_reader.refine_dial_ellipse_from_pose_prior",
+                return_value=repaired,
+            ),
+        ):
+            ellipse = detect_dial_ellipse(image, pointer_mask)
+
+        self.assertGreater(min(ellipse[1]), 400.0)
+
+    def test_multiple_rims_use_consensus_pointer_rectification(self):
+        pointer_mask = np.zeros((400, 400), dtype=np.uint8)
+        cv2.line(pointer_mask, (200, 200), (100, 300), 1, 8)
+        candidates = [
+            (0.010, 0.010, ((200.0, 200.0), (300.0, 390.0), 5.0)),
+            (0.020, 0.020, ((180.0, 205.0), (330.0, 390.0), 5.0)),
+            (0.030, 0.030, ((182.0, 203.0), (350.0, 414.0), 5.0)),
+        ]
+
+        selected = select_consensus_dial_ellipse(candidates, pointer_mask)
+
+        self.assertIn(selected, candidates)
+        self.assertNotEqual(selected, candidates[0])
+
+    def test_shifted_large_contour_does_not_beat_concentric_dial_rims(self):
+        pointer_mask = np.zeros((520, 1091), dtype=np.uint8)
+        cv2.line(pointer_mask, (596, 212), (528, 458), 1, 8)
+        candidates = [
+            (
+                0.089,
+                0.053,
+                ((559.0, 253.0), (288.0, 668.0), 96.2),
+            ),
+            (
+                0.108,
+                0.065,
+                ((552.0, 254.0), (239.0, 564.0), 96.6),
+            ),
+            (
+                0.131,
+                0.082,
+                ((534.0, 265.0), (202.0, 482.0), 97.5),
+            ),
+            (
+                0.123,
+                0.091,
+                ((688.0, 240.0), (309.0, 836.0), 91.0),
+            ),
+            (
+                0.125,
+                0.106,
+                ((706.0, 238.0), (402.0, 832.0), 81.9),
+            ),
+            (
+                0.146,
+                0.113,
+                ((591.0, 304.0), (304.0, 627.0), 92.1),
+            ),
+            (
+                0.146,
+                0.113,
+                ((593.0, 303.0), (306.0, 631.0), 91.8),
+            ),
+        ]
+
+        selected = select_consensus_dial_ellipse(candidates, pointer_mask)
+
+        self.assertEqual(selected, candidates[0])
+
+    def test_hub_circle_repairs_shifted_partial_rim_center(self):
+        ellipse = ((622.0, 774.0), (994.0, 1066.0), 160.0)
+
+        refined = select_hub_consistent_ellipse_center(
+            ellipse,
+            np.asarray((732.0, 771.0)),
+            np.asarray(((722.0, 763.0, 32.0), (680.0, 800.0, 55.0))),
+            (1607, 1406),
+        )
+
+        self.assertEqual(refined[0], (722.0, 763.0))
+
+    def test_existing_hub_circle_keeps_concentric_rim_center(self):
+        ellipse = ((559.0, 253.0), (288.0, 668.0), 96.0)
+
+        refined = select_hub_consistent_ellipse_center(
+            ellipse,
+            np.asarray((596.0, 212.0)),
+            np.asarray(((563.0, 235.0, 21.0), (596.0, 209.0, 14.0))),
+            (520, 1091),
+        )
+
+        self.assertEqual(refined, ellipse)
 
 
 if __name__ == "__main__":

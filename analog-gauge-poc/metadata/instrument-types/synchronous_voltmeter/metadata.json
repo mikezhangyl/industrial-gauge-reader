@@ -36,7 +36,7 @@
           }
         ],
         "dial_arc": {
-          "start_angle_degrees": 268,
+          "start_angle_degrees": 270,
           "end_angle_degrees": 92,
           "direction": "clockwise",
           "endpoint_snap_degrees": 2,

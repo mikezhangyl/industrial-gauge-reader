@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "rectangular_panel_voltmeter",
+    "canonical_name_zh": "矩形面板电压表",
+    "aliases_zh": ["面板电压表"],
+    "model_markings": [],
+    "recognition_signatures": [["50", "100", "150"]],
+    "knowledge_status": "provisional",
+    "summary_zh": "矩形面板上的 0–150 V 单刻度模拟指针电压表。",
+    "readout_channels": [
+      {
+        "channel_id": "voltage",
+        "name_zh": "电压",
+        "display_type": "analog_pointer",
+        "quantity_kind": "voltage",
+        "unit": "V",
+        "value_format": "decimal",
+        "semantics_zh": "按 0–150 V 刻度读取指针位置。",
+        "scales": [{"minimum": 0, "maximum": 150, "minor_division": 5}],
+        "dial_arc": {
+          "start_angle_degrees": 270,
+          "end_angle_degrees": 0,
+          "direction": "clockwise",
+          "endpoint_snap_degrees": 3,
+          "quantize_to_minor_division": true
+        }
+      }
+    ],
+    "interpretation_rules_zh": [
+      "同一排相同表盘分别读取，不因型号相同而合并成一个实例。",
+      "候选指针线本体或其延长线必须穿过真实轴心。"
+    ],
+    "sources": [
+      {
+        "source_type": "image_observation",
+        "title": "iter3 三联 0–150 V 面板表图片",
+        "reference": "sha256:0155a00cb0222b9408b5dd080ed58eef68352d17c59715f41328dee17bb71cbc"
+      }
+    ]
+  }
+}

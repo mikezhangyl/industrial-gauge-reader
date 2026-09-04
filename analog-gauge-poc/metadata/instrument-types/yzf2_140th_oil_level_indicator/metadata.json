@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "instrument_type": {
+    "type_id": "yzf2_140th_oil_level_indicator",
+    "canonical_name_zh": "YZF2-140TH 指针式油位计",
+    "aliases_zh": ["YZF2 油位计"],
+    "model_markings": ["YZF2-140TH"],
+    "recognition_signatures": [["YZF2", "OIL LEVEL INDICATOR"]],
+    "knowledge_status": "provisional",
+    "summary_zh": "YZF2-140TH 圆形 0–10 指针式油位计；当前用可见数字刻度拟合读数。",
+    "readout_channels": [
+      {
+        "channel_id": "relative_oil_level",
+        "name_zh": "相对油位",
+        "display_type": "analog_pointer_with_counterweight",
+        "quantity_kind": "relative_liquid_level",
+        "unit": "relative_scale",
+        "value_format": "decimal",
+        "semantics_zh": "读取细长指针在 0–10 数字刻度上的位置。",
+        "scales": [{"minimum": 0, "maximum": 10, "minor_division": 1}]
+      }
+    ],
+    "interpretation_rules_zh": [
+      "读取从轴心伸向左侧 0–10 刻度环的细长指针端。",
+      "轴心右侧短粗块是配重，不作为读数端。",
+      "不得套用外观相近但刻度弧不同的 KEOI/YZF3 油位计固定角度映射。"
+    ],
+    "sources": [
+      {
+        "source_type": "image_observation",
+        "title": "YZF2-140TH 表盘型号与 0–10 刻度现场图片",
+        "reference": "sha256:868e1afe635c6e6b248b8bc0cf15a2d26eff352eea901327fd1b87c791077460"
+      }
+    ]
+  }
+}

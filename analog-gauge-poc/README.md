@@ -28,7 +28,7 @@
 → 检测失败时回退为通用圆形表盘检测
 → ETHZ 指针分割
 → 从指针最粗处估算轴心，使用可见圆弧拟合被遮挡的表盘椭圆
-→ 椭圆仿射校正为圆形表盘
+→ 以实体内外环和轴心验证姿态；证据充分时做透视校正，否则仿射降级
 → 全表盘 OCR 尝试匹配可选的仪表类型知识包；未匹配时继续通用指针读取
 → 数字分支：刻度环 OCR → 鲁棒线性刻度拟合
 → 颜色分支：红绿分段 → 红绿交界零点 → 相对段值
@@ -66,7 +66,7 @@ metadata/instrument-types/<type_id>/
 
 SHM-D 电动机构有三个独立通道：外圈长指针是当前分接位置，内圈是机构状态，机械计数窗是累计操作次数。位置标签是离散值，`9a`、`9b`、`9c` 不能合并成 `9`。厂家说明书和对应 `metadata.json` 位于同一类型目录，metadata 同时保存官方 URL、文档编号和本地文件 SHA-256。
 
-JS-9 指针式放电计数器是离散的单圈数字盘，不按连续模拟刻度输出小数。表盘显示 `0` 时只记录当前可见数字 `0`；没有复位、进位或检修记录时，不据此推断设备全寿命累计动作总数。程序会保留几何算法得到的原始视觉读数，例如 `-0.05`，再按该类型 metadata 的允许值和最大归整距离输出业务读数 `0`。
+JS-9 指针式放电计数器是离散的单圈数字盘，不按连续模拟刻度输出小数。程序先验证完整物理外圈并把表盘、轴心和指针一起校正到正视坐标，再将校正角度归整到 `0–9` 允许值。表盘显示 `0` 时只记录当前可见数字 `0`；没有复位、进位或检修记录时，不据此推断设备全寿命累计动作总数。外圈姿态证据不足时，报告必须明确标记未校正降级路径，不能用归整掩盖错误指针方向。
 
 查询已经收录的类型：
 
@@ -90,6 +90,12 @@ python -m src.instrument_metadata "上海电瓷厂 JS-9 放电计数器"
 ```bash
 python batch_instrument_report.py input/iter2
 ```
+
+默认使用已经回归的 `448-highres-pad` 管线。它以最长边 1920 的等比例副本定位表盘并执行 448×448 指针分割，再把候选框和掩膜映射回方向校正后的原图做表盘外圈裁剪、椭圆校正、OCR 与几何读取。尺寸适配仍必须使用 `--pipeline-profile` 命名实验，并用 `compare_pipeline_profiles.py` 做完整比较；不能仅凭单张图片或 checkpoint 中的 `imgsz` 替换默认值。
+
+批次始终准备最长边 1920 的定位图；默认 `448-highres-pad` 还保留完整分辨率细节图，非正方形表盘保持比例补边后才缩放到模型输入尺寸。旧 `448` 只保留为回归比较基线；`448-highres` 与 `448-highres-seg` 是诊断 profile。
+
+调试图片比例、裁剪、补边或坐标映射时，在批次或 profile 比较命令增加 `--export-processing-stages`。报告目录会保存实际执行路径的无损阶段 PNG，并在 JSON/HTML 中记录真实尺寸、宽高比和变换；该诊断开关不改变模型权重、profile 或识别分支。完整命令和目录契约见 `docs/user-instrument-batch-runbook.md`。
 
 目录名自动成为输出批次名；上述命令生成 `output/iter2/instrument-report.json` 和同名 HTML，并在终端打印两者的绝对路径。输入目录只能放原始、未画框和未写入读数的现场照片；程序检测到本项目生成的 `Pointer angle / Sweep position / Reading` 可视化覆盖层时，会生成明确失败记录并返回退出码 `2`，而不是继续给出伪读数。程序按 EXIF 方向和最长边 1920 像素标准化图片，不修改输入文件。HTML 使用统一大小的清晰预览，按检测区域裁剪并用绿色框标出仪表，不依赖原始路径，也不展示置信度、人工答案或比对结论。JSON 保留原图/分析图哈希和尺寸、检测框、运行环境、模型哈希及完整自动结果，便于跨机器核对。
 
@@ -203,8 +209,8 @@ T_steady = T_preprocess + T_inference + T_postprocess
 
 ```bash
 python -m unittest discover -s tests -v
-uvx ruff check src benchmark.py regression_report.py batch_instrument_report.py tests
-uvx ty check src benchmark.py regression_report.py batch_instrument_report.py
+uvx ruff check src benchmark.py regression_report.py batch_instrument_report.py compare_pipeline_profiles.py tests
+uvx ty check src benchmark.py regression_report.py batch_instrument_report.py compare_pipeline_profiles.py
 ```
 
 ## 模型来源

@@ -46,14 +46,47 @@ class BatchIOTests(unittest.TestCase):
             Image.new("RGB", (3000, 1000), "white").save(source)
 
             normalized = normalize_batch_images(
-                [source], root / "normalized", max_edge=1920
+                [source],
+                root / "normalized",
+                max_edge=1920,
+                preserve_full_resolution_detail=True,
             )[0]
 
             self.assertEqual(normalized.source_size, (3000, 1000))
             self.assertEqual(normalized.normalized_size, (1920, 640))
+            self.assertEqual(normalized.detail_size, (3000, 1000))
             self.assertEqual(normalized.analysis_path.suffix, ".png")
+            self.assertNotEqual(normalized.detail_path, normalized.analysis_path)
             with Image.open(normalized.analysis_path) as image:
                 self.assertEqual(image.size, (1920, 640))
+            with Image.open(normalized.detail_path) as image:
+                self.assertEqual(image.size, (3000, 1000))
+
+    def test_small_image_reuses_the_lossless_analysis_file_as_detail_source(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "small.jpg"
+            Image.new("RGB", (640, 480), "white").save(source)
+
+            normalized = normalize_batch_images(
+                [source], root / "normalized", max_edge=1920
+            )[0]
+
+            self.assertEqual(normalized.detail_path, normalized.analysis_path)
+            self.assertEqual(normalized.detail_size, (640, 480))
+
+    def test_default_normalization_does_not_duplicate_unused_full_resolution(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "large.jpg"
+            Image.new("RGB", (3000, 1000), "white").save(source)
+
+            normalized = normalize_batch_images(
+                [source], root / "normalized", max_edge=1920
+            )[0]
+
+            self.assertEqual(normalized.detail_path, normalized.analysis_path)
+            self.assertEqual(normalized.detail_size, (1920, 640))
 
     def test_preview_uses_a_padded_detection_crop_and_fixed_canvas(self):
         detections = [{"instance_id": "instance_1", "bbox": [200, 100, 600, 500]}]
